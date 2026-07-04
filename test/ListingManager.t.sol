@@ -11,6 +11,7 @@ contract ListingManagerTest is Test {
     address internal controller = makeAddr("controller"); // stand-in for Settlement.sol / DisputeManager.sol
     address internal seller = makeAddr("seller");
     address internal stranger = makeAddr("stranger");
+    address internal buyer = makeAddr("buyer");
 
     uint256 internal constant PRICE = 1 ether;
     uint256 internal constant PER_SLOT_LOCKED = 1.5 ether;
@@ -120,11 +121,12 @@ contract ListingManagerTest is Test {
         uint256 listingId = lm.createListing(PRICE, 2, WINDOW);
 
         vm.prank(controller);
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
 
-        (ListingManager.SlotStatus status, uint256 deadline) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status, uint256 deadline, address recordedBuyer) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.PaymentConfirmed));
         assertEq(deadline, block.timestamp + WINDOW);
+        assertEq(recordedBuyer, buyer, "buyer of record must be stored for later restitution routing");
 
         (,,, uint256 emptySlots,,,) = lm.listings(listingId);
         assertEq(emptySlots, 1);
@@ -136,18 +138,18 @@ contract ListingManagerTest is Test {
 
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.NotController.selector, stranger));
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
     }
 
     function test_ConfirmPaymentRevertsWhenSlotNotEmpty() public {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
         vm.prank(controller);
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
 
         vm.prank(controller);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotEmpty.selector, listingId, 0));
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
     }
 
     function test_ConfirmPaymentRevertsOnOutOfRangeSlot() public {
@@ -156,7 +158,7 @@ contract ListingManagerTest is Test {
 
         vm.prank(controller);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotIndexOutOfRange.selector, 1, 1));
-        lm.confirmPayment(listingId, 1);
+        lm.confirmPayment(listingId, 1, buyer);
     }
 
     function test_ConfirmPaymentRevertsOnClosedListing() public {
@@ -167,7 +169,7 @@ contract ListingManagerTest is Test {
 
         vm.prank(controller);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.ListingAlreadyClosed.selector, listingId));
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
     }
 
     // ── finalizeExpiredSlot ────────────────────────────────────────────────────────────────────────────────────
@@ -176,7 +178,7 @@ contract ListingManagerTest is Test {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
         vm.prank(controller);
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
 
         vm.expectRevert(
             abi.encodeWithSelector(ListingManager.WindowNotYetExpired.selector, listingId, 0, block.timestamp + WINDOW)
@@ -188,13 +190,13 @@ contract ListingManagerTest is Test {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
         vm.prank(controller);
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
 
         vm.warp(block.timestamp + WINDOW);
         vm.prank(stranger); // anyone may call this - no controller check
         lm.finalizeExpiredSlot(listingId, 0);
 
-        (ListingManager.SlotStatus status, uint256 deadline) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status, uint256 deadline,) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed)); // spent, not recycled to Empty
         assertEq(deadline, 0);
         assertEq(bond.freeIB(seller), 100 ether); // fully restored: locked at creation, unlocked at finalization
@@ -213,7 +215,7 @@ contract ListingManagerTest is Test {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
         vm.prank(controller);
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
 
         vm.prank(controller);
         lm.markDisputed(listingId, 0);
@@ -232,7 +234,7 @@ contract ListingManagerTest is Test {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
         vm.prank(controller);
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
 
         vm.warp(block.timestamp + WINDOW - 1);
         vm.prank(controller);
@@ -249,7 +251,7 @@ contract ListingManagerTest is Test {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
         vm.prank(controller);
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
 
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.NotController.selector, stranger));
@@ -263,12 +265,12 @@ contract ListingManagerTest is Test {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
         vm.startPrank(controller);
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
         lm.markDisputed(listingId, 0);
         lm.resolveDispute(listingId, 0);
         vm.stopPrank();
 
-        (ListingManager.SlotStatus status,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
         (,,, uint256 emptySlots,,,) = lm.listings(listingId);
         assertEq(emptySlots, 0); // Removed does not count as reusable capacity
@@ -278,7 +280,7 @@ contract ListingManagerTest is Test {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
         vm.prank(controller);
-        lm.confirmPayment(listingId, 0);
+        lm.confirmPayment(listingId, 0, buyer);
         vm.prank(seller);
         lm.closeListing(listingId); // no empty slots to release yet, but blocks future reuse
 
@@ -287,7 +289,7 @@ contract ListingManagerTest is Test {
         lm.resolveDispute(listingId, 0);
         vm.stopPrank();
 
-        (ListingManager.SlotStatus status,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
         (,,, uint256 emptySlots,,,) = lm.listings(listingId);
         assertEq(emptySlots, 0);
@@ -307,7 +309,7 @@ contract ListingManagerTest is Test {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 3, WINDOW);
         vm.prank(controller);
-        lm.confirmPayment(listingId, 0); // slot 0 now occupied; slots 1,2 still empty
+        lm.confirmPayment(listingId, 0, buyer); // slot 0 now occupied; slots 1,2 still empty
 
         vm.prank(seller);
         lm.reduceSlots(listingId, 2);
@@ -316,8 +318,8 @@ contract ListingManagerTest is Test {
         assertEq(emptySlots, 0);
         assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED * 3 + PER_SLOT_LOCKED * 2);
 
-        (ListingManager.SlotStatus s1,) = lm.slots(listingId, 1);
-        (ListingManager.SlotStatus s2,) = lm.slots(listingId, 2);
+        (ListingManager.SlotStatus s1,,) = lm.slots(listingId, 1);
+        (ListingManager.SlotStatus s2,,) = lm.slots(listingId, 2);
         assertEq(uint8(s1), uint8(ListingManager.SlotStatus.Removed));
         assertEq(uint8(s2), uint8(ListingManager.SlotStatus.Removed));
     }
@@ -328,13 +330,13 @@ contract ListingManagerTest is Test {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 2, WINDOW);
         vm.prank(controller);
-        lm.confirmPayment(listingId, 0); // 1 empty slot remains (index 1)
+        lm.confirmPayment(listingId, 0, buyer); // 1 empty slot remains (index 1)
 
         vm.prank(seller);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.InsufficientEmptySlots.selector, listingId, 2, 1));
         lm.reduceSlots(listingId, 2); // asking for both is impossible - slot 0 is confirmed, not empty
 
-        (ListingManager.SlotStatus s0,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus s0,,) = lm.slots(listingId, 0);
         assertEq(uint8(s0), uint8(ListingManager.SlotStatus.PaymentConfirmed)); // untouched
     }
 
@@ -350,7 +352,7 @@ contract ListingManagerTest is Test {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 2, WINDOW);
         vm.prank(controller);
-        lm.confirmPayment(listingId, 0); // 1 confirmed, 1 empty
+        lm.confirmPayment(listingId, 0, buyer); // 1 confirmed, 1 empty
 
         vm.prank(seller);
         lm.closeListing(listingId);
@@ -361,13 +363,13 @@ contract ListingManagerTest is Test {
 
         vm.prank(controller);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.ListingAlreadyClosed.selector, listingId));
-        lm.confirmPayment(listingId, 1);
+        lm.confirmPayment(listingId, 1, buyer);
 
         // the still-confirmed slot 0 continues its normal lifecycle untouched
         vm.warp(block.timestamp + WINDOW);
         lm.finalizeExpiredSlot(listingId, 0);
         assertEq(bond.freeIB(seller), 100 ether); // fully released once slot 0 also resolves
-        (ListingManager.SlotStatus s0,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus s0,,) = lm.slots(listingId, 0);
         assertEq(uint8(s0), uint8(ListingManager.SlotStatus.Removed)); // spent, not recycled to Empty
     }
 
@@ -412,7 +414,7 @@ contract ListingManagerTest is Test {
         uint256 listingId = lm.createListing(PRICE, totalSlots, WINDOW);
         vm.startPrank(controller);
         for (uint256 i = 0; i < confirmCount; i++) {
-            lm.confirmPayment(listingId, i);
+            lm.confirmPayment(listingId, i, buyer);
         }
         vm.stopPrank();
 
@@ -428,7 +430,7 @@ contract ListingManagerTest is Test {
         lm.reduceSlots(listingId, totalSlots); // requesting all N must fail whenever any slot is confirmed
 
         for (uint256 i = 0; i < confirmCount; i++) {
-            (ListingManager.SlotStatus s,) = lm.slots(listingId, i);
+            (ListingManager.SlotStatus s,,) = lm.slots(listingId, i);
             assertEq(uint8(s), uint8(ListingManager.SlotStatus.PaymentConfirmed));
         }
     }

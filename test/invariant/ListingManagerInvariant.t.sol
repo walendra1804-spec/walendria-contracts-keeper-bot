@@ -57,7 +57,7 @@ contract ListingManagerInvariantTest is Test {
                 if (listingSeller != seller) continue;
 
                 for (uint256 slotIdx = 0; slotIdx < totalSlots; slotIdx++) {
-                    (ListingManager.SlotStatus status,) = lm.slots(listingId, slotIdx);
+                    (ListingManager.SlotStatus status,,) = lm.slots(listingId, slotIdx);
                     if (status != ListingManager.SlotStatus.Removed) {
                         expectedLocked += perSlotLocked;
                     }

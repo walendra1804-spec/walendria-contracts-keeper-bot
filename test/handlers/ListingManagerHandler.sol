@@ -47,11 +47,12 @@ contract ListingManagerHandler is Test {
         (,, uint256 totalSlots,,,, bool closed) = lm.listings(listingId);
         if (closed) return;
         uint256 slotIndex = slotSeed % totalSlots;
-        (ListingManager.SlotStatus status,) = lm.slots(listingId, slotIndex);
+        (ListingManager.SlotStatus status,,) = lm.slots(listingId, slotIndex);
         if (status != ListingManager.SlotStatus.Empty) return;
 
+        address buyer = makeAddr(string.concat("handlerBuyer", vm.toString(listingId), vm.toString(slotIndex)));
         vm.prank(controller);
-        lm.confirmPayment(listingId, slotIndex);
+        lm.confirmPayment(listingId, slotIndex, buyer);
     }
 
     function finalizeExpiredSlot(uint256 listingSeed, uint256 slotSeed) external {
@@ -59,7 +60,7 @@ contract ListingManagerHandler is Test {
         uint256 listingId = _pickListing(listingSeed);
         (,, uint256 totalSlots,,,,) = lm.listings(listingId);
         uint256 slotIndex = slotSeed % totalSlots;
-        (ListingManager.SlotStatus status, uint256 deadline) = lm.slots(listingId, slotIndex);
+        (ListingManager.SlotStatus status, uint256 deadline,) = lm.slots(listingId, slotIndex);
         if (status != ListingManager.SlotStatus.PaymentConfirmed) return;
         if (block.timestamp < deadline) {
             vm.warp(deadline);
@@ -72,7 +73,7 @@ contract ListingManagerHandler is Test {
         uint256 listingId = _pickListing(listingSeed);
         (,, uint256 totalSlots,,,,) = lm.listings(listingId);
         uint256 slotIndex = slotSeed % totalSlots;
-        (ListingManager.SlotStatus status,) = lm.slots(listingId, slotIndex);
+        (ListingManager.SlotStatus status,,) = lm.slots(listingId, slotIndex);
         if (status != ListingManager.SlotStatus.PaymentConfirmed) return;
 
         vm.prank(controller);
@@ -84,7 +85,7 @@ contract ListingManagerHandler is Test {
         uint256 listingId = _pickListing(listingSeed);
         (address seller,, uint256 totalSlots,,, uint256 perSlotLocked,) = lm.listings(listingId);
         uint256 slotIndex = slotSeed % totalSlots;
-        (ListingManager.SlotStatus status,) = lm.slots(listingId, slotIndex);
+        (ListingManager.SlotStatus status,,) = lm.slots(listingId, slotIndex);
         if (status != ListingManager.SlotStatus.Disputed) return;
 
         // Stand in for DisputeManager (Phase 7): unlock the slot's IB directly on the bond *before* telling

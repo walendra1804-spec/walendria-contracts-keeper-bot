@@ -49,6 +49,17 @@ contract SpectralMarket is ReentrancyGuard {
     mapping(uint256 marketId => mapping(Side => mapping(address trader => uint256))) public sharesOf;
     mapping(address controller => bool) public isController;
 
+    /// @notice Count of distinct addresses that have EVER held a nonzero balance of `Side` in `marketId`, credited
+    ///         once per address the first time it acquires a nonzero position and never decremented - selling
+    ///         back to zero does not undo it. Together with a current-balance check, this is what lets
+    ///         DisputeManager.sol (Phase 7) implement Section 2.6.10's mutual-early-resolution eligibility
+    ///         correctly: a current-balance check alone would wrongly re-permit the path once a third party who
+    ///         bought in fully exits, since LMSR round-trips a buy-then-sell back to the exact same q. The
+    ///         invariant that matters ("does not reopen even if that address later exits their position") needs
+    ///         this monotonic count, which only this contract can track - it alone sees every trade unconditionally.
+    mapping(uint256 marketId => mapping(Side => uint256)) public distinctHolderCount;
+    mapping(uint256 marketId => mapping(Side => mapping(address trader => bool))) public everHeldShares;
+
     /// @notice Called after every successful {buy}/{sell} (Section 2.6.8's checkpoint-on-trade). Address(0) is a
     ///         valid, deliberate choice meaning "no condition tracking wired in" - useful for isolating pure
     ///         market-mechanics tests from Phase 6's resolution-condition concerns; a real deployment must wire
@@ -153,8 +164,10 @@ contract SpectralMarket is ReentrancyGuard {
         m.open = true;
 
         for (uint256 i = 0; i < guiltyFunders.length; i++) {
+            _markHolder(marketId, Side.Guilty, guiltyFunders[i]);
             sharesOf[marketId][Side.Guilty][guiltyFunders[i]] += guiltyAmounts[i] * 2;
         }
+        _markHolder(marketId, Side.Innocent, innocentRecipient);
         sharesOf[marketId][Side.Innocent][innocentRecipient] += innocentAmount * 2;
 
         emit MarketOpened(marketId, b, totalIn, totalIn);
@@ -186,6 +199,7 @@ contract SpectralMarket is ReentrancyGuard {
             m.qInnocent = m.qInnocent + dq;
         }
         m.pooled += cost;
+        _markHolder(marketId, side, msg.sender);
         sharesOf[marketId][side][msg.sender] += shares;
 
         emit Bought(marketId, side, msg.sender, shares, cost);
@@ -307,6 +321,16 @@ contract SpectralMarket is ReentrancyGuard {
             m.resolved = true;
             m.winningSide = guiltyWins ? Side.Guilty : Side.Innocent;
             emit MarketResolved(marketId, m.winningSide);
+        }
+    }
+
+    /// @dev Records `trader` as a `side` holder of `marketId` the first time they ever acquire a nonzero balance,
+    ///      guarding against double-counting the same address twice (defensive: a well-formed caller's
+    ///      `guiltyFunders` never contains a duplicate, but this keeps the count correct even if one ever did).
+    function _markHolder(uint256 marketId, Side side, address trader) private {
+        if (!everHeldShares[marketId][side][trader]) {
+            everHeldShares[marketId][side][trader] = true;
+            distinctHolderCount[marketId][side] += 1;
         }
     }
 

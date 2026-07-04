@@ -71,7 +71,7 @@ contract Settlement is ReentrancyGuard {
         uint256 proceeds = price - fee;
         uint256 excess = msg.value - price;
 
-        listingManager.confirmPayment(listingId, slotIndex);
+        listingManager.confirmPayment(listingId, slotIndex, msg.sender);
 
         if (excess > 0) {
             (bool refundOk,) = msg.sender.call{value: excess}("");

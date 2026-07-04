@@ -57,6 +57,7 @@ contract ListingManager {
     struct Slot {
         SlotStatus status;
         uint256 completionDeadline; // meaningful only while status == PaymentConfirmed
+        address buyer; // meaningful only once status has passed Empty; set once, at confirmPayment, never reset
     }
 
     /// @notice Protocol-enforced floor (Section 2.5, 2.9): no listing may offer a shorter completion window.
@@ -81,7 +82,9 @@ contract ListingManager {
         uint256 completionWindow,
         uint256 perSlotLocked
     );
-    event SlotPaymentConfirmed(uint256 indexed listingId, uint256 indexed slotIndex, uint256 completionDeadline);
+    event SlotPaymentConfirmed(
+        uint256 indexed listingId, uint256 indexed slotIndex, address indexed buyer, uint256 completionDeadline
+    );
     event SlotFinalized(uint256 indexed listingId, uint256 indexed slotIndex);
     event SlotDisputed(uint256 indexed listingId, uint256 indexed slotIndex);
     event SlotResolved(uint256 indexed listingId, uint256 indexed slotIndex);
@@ -152,9 +155,14 @@ contract ListingManager {
         emit ListingCreated(listingId, msg.sender, price, totalSlots, completionWindow, perSlotLocked);
     }
 
-    /// @notice Marks `slotIndex` as paid, starting its completion-window clock. Called by Settlement.sol in the
-    ///         same atomic step that verifies payment (Section 2.3).
-    function confirmPayment(uint256 listingId, uint256 slotIndex) external onlyController {
+    /// @notice Marks `slotIndex` as paid, starting its completion-window clock, and records `buyer` as the slot's
+    ///         permanent buyer of record. Called by Settlement.sol in the same atomic step that verifies payment
+    ///         (Section 2.3), passing through its own `msg.sender`.
+    /// @dev `buyer` is stored (not just emitted) because DisputeManager.sol (Phase 7) needs it later: Section 3.1
+    ///      restitution is paid to the defrauded buyer specifically, "regardless of who funded the Guilty-side
+    ///      position" - which can be a mix of the buyer and outside backers (Section 2.4). Without persisting the
+    ///      buyer here, nothing on-chain would know who that is by the time a dispute resolves.
+    function confirmPayment(uint256 listingId, uint256 slotIndex, address buyer) external onlyController {
         Listing storage listing = _requireListing(listingId);
         if (listing.closed) revert ListingAlreadyClosed(listingId);
         if (slotIndex >= listing.totalSlots) revert SlotIndexOutOfRange(slotIndex, listing.totalSlots);
@@ -164,9 +172,10 @@ contract ListingManager {
 
         slot.status = SlotStatus.PaymentConfirmed;
         slot.completionDeadline = block.timestamp + listing.completionWindow;
+        slot.buyer = buyer;
         listing.emptySlots -= 1;
 
-        emit SlotPaymentConfirmed(listingId, slotIndex, slot.completionDeadline);
+        emit SlotPaymentConfirmed(listingId, slotIndex, buyer, slot.completionDeadline);
     }
 
     /// @notice Permissionlessly finalizes a slot whose completion window has elapsed with no dispute ever
