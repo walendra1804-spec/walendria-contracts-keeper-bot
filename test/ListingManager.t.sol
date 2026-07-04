@@ -1,0 +1,435 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Test} from "forge-std/Test.sol";
+import {IntegrityBond} from "../src/IntegrityBond.sol";
+import {ListingManager} from "../src/ListingManager.sol";
+
+contract ListingManagerTest is Test {
+    IntegrityBond internal bond;
+    ListingManager internal lm;
+    address internal controller = makeAddr("controller"); // stand-in for Settlement.sol / DisputeManager.sol
+    address internal seller = makeAddr("seller");
+    address internal stranger = makeAddr("stranger");
+
+    uint256 internal constant PRICE = 1 ether;
+    uint256 internal constant PER_SLOT_LOCKED = 1.5 ether;
+    uint256 internal constant WINDOW = 72 hours;
+
+    function setUp() public {
+        // IntegrityBond needs ListingManager's address (as its controller) and ListingManager needs
+        // IntegrityBond's address (immutable) - a real deployment resolves this circular reference via CREATE2
+        // address prediction (the Factory pattern from the build strategy's open items). Here, plain CREATE
+        // nonces from this same test contract are just as predictable, so we predict ListingManager's
+        // soon-to-exist address before deploying IntegrityBond, then deploy ListingManager into it.
+        uint256 nonce = vm.getNonce(address(this));
+        address predictedLm = vm.computeCreateAddress(address(this), nonce + 1);
+        bond = new IntegrityBond(_singleton(predictedLm));
+
+        address[] memory lmControllers = new address[](1);
+        lmControllers[0] = controller;
+        lm = new ListingManager(bond, lmControllers);
+        assertEq(address(lm), predictedLm, "CREATE nonce prediction drifted");
+
+        vm.deal(seller, 1000 ether);
+        vm.prank(seller);
+        bond.deposit{value: 100 ether}();
+    }
+
+    function _singleton(address a) internal pure returns (address[] memory arr) {
+        arr = new address[](1);
+        arr[0] = a;
+    }
+
+    // ── createListing ──────────────────────────────────────────────────────────────────────────────────────────
+
+    function test_CreateListingLocksOnePointFiveTimesPriceTimesSlots() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 3, WINDOW);
+
+        (
+            address s,
+            uint256 price,
+            uint256 totalSlots,
+            uint256 emptySlots,
+            uint256 completionWindow,
+            uint256 perSlotLocked,
+            bool closed
+        ) = lm.listings(listingId);
+        assertEq(s, seller);
+        assertEq(price, PRICE);
+        assertEq(totalSlots, 3);
+        assertEq(emptySlots, 3);
+        assertEq(completionWindow, WINDOW);
+        assertEq(perSlotLocked, PER_SLOT_LOCKED);
+        assertFalse(closed);
+
+        assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED * 3);
+    }
+
+    function test_CreateListingRoundsLockRequirementUp() public {
+        // price = 1 wei -> 1.5 wei is not representable; must round UP to 2 wei so the bond is never under
+        // the true 1.5P requirement (rounding down would silently under-collateralize the seller).
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(1, 1, WINDOW);
+        (,,,,, uint256 perSlotLocked,) = lm.listings(listingId);
+        assertEq(perSlotLocked, 2);
+    }
+
+    function test_CreateListingRevertsOnZeroPrice() public {
+        vm.prank(seller);
+        vm.expectRevert(ListingManager.ZeroPrice.selector);
+        lm.createListing(0, 1, WINDOW);
+    }
+
+    function test_CreateListingRevertsOnZeroSlots() public {
+        vm.prank(seller);
+        vm.expectRevert(ListingManager.ZeroSlots.selector);
+        lm.createListing(PRICE, 0, WINDOW);
+    }
+
+    function test_CreateListingRevertsWhenExceedingMaxSlots() public {
+        // Resolve MAX_SLOTS into locals *before* arming expectRevert - vm.expectRevert() fires on the very next
+        // external call, and lm.MAX_SLOTS() staticcalls evaluated inline as call arguments would otherwise be
+        // "the next call" instead of createListing() itself.
+        uint256 max = lm.MAX_SLOTS();
+        uint256 tooMany = max + 1;
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.TooManySlots.selector, tooMany, max));
+        lm.createListing(PRICE, tooMany, WINDOW);
+    }
+
+    /// @notice Direct regression test named in the build strategy: a listing cannot be created with a
+    ///         completion window below the protocol minimum.
+    function test_CreateListingRevertsWhenWindowBelowMinimum() public {
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.CompletionWindowTooShort.selector, WINDOW - 1, WINDOW));
+        lm.createListing(PRICE, 1, WINDOW - 1);
+    }
+
+    function test_CreateListingRevertsWhenInsufficientFreeIB() public {
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(IntegrityBond.InsufficientFreeIB.selector, seller, 150 ether, 100 ether));
+        lm.createListing(PRICE, 100, WINDOW); // 1.5 * 1 ether * 100 = 150 ether > 100 ether free
+    }
+
+    // ── confirmPayment ─────────────────────────────────────────────────────────────────────────────────────────
+
+    function test_ConfirmPaymentStartsCompletionWindow() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 2, WINDOW);
+
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0);
+
+        (ListingManager.SlotStatus status, uint256 deadline) = lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.PaymentConfirmed));
+        assertEq(deadline, block.timestamp + WINDOW);
+
+        (,,, uint256 emptySlots,,,) = lm.listings(listingId);
+        assertEq(emptySlots, 1);
+    }
+
+    function test_ConfirmPaymentRevertsWhenNotController() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.NotController.selector, stranger));
+        lm.confirmPayment(listingId, 0);
+    }
+
+    function test_ConfirmPaymentRevertsWhenSlotNotEmpty() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0);
+
+        vm.prank(controller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotEmpty.selector, listingId, 0));
+        lm.confirmPayment(listingId, 0);
+    }
+
+    function test_ConfirmPaymentRevertsOnOutOfRangeSlot() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+
+        vm.prank(controller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotIndexOutOfRange.selector, 1, 1));
+        lm.confirmPayment(listingId, 1);
+    }
+
+    function test_ConfirmPaymentRevertsOnClosedListing() public {
+        vm.startPrank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        lm.closeListing(listingId);
+        vm.stopPrank();
+
+        vm.prank(controller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.ListingAlreadyClosed.selector, listingId));
+        lm.confirmPayment(listingId, 0);
+    }
+
+    // ── finalizeExpiredSlot ────────────────────────────────────────────────────────────────────────────────────
+
+    function test_FinalizeExpiredSlotRevertsBeforeDeadline() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ListingManager.WindowNotYetExpired.selector, listingId, 0, block.timestamp + WINDOW)
+        );
+        lm.finalizeExpiredSlot(listingId, 0);
+    }
+
+    function test_FinalizeExpiredSlotSucceedsAfterDeadlineAndIsPermissionless() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0);
+
+        vm.warp(block.timestamp + WINDOW);
+        vm.prank(stranger); // anyone may call this - no controller check
+        lm.finalizeExpiredSlot(listingId, 0);
+
+        (ListingManager.SlotStatus status, uint256 deadline) = lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed)); // spent, not recycled to Empty
+        assertEq(deadline, 0);
+        assertEq(bond.freeIB(seller), 100 ether); // fully restored: locked at creation, unlocked at finalization
+    }
+
+    function test_FinalizeExpiredSlotRevertsOnEmptySlot() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotPaymentConfirmed.selector, listingId, 0));
+        lm.finalizeExpiredSlot(listingId, 0);
+    }
+
+    /// @notice Direct regression test named in the build strategy and Section 2.5: an open dispute is never
+    ///         subject to the window's expiry, even long after the window would otherwise have elapsed.
+    function test_DisputedSlotCannotBeFinalizedByWindowExpiryEvenLongAfterDeadline() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0);
+
+        vm.prank(controller);
+        lm.markDisputed(listingId, 0);
+
+        vm.warp(block.timestamp + WINDOW * 10); // far past any reasonable expiry
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotPaymentConfirmed.selector, listingId, 0));
+        lm.finalizeExpiredSlot(listingId, 0);
+
+        // capital stays locked, untouched, the whole time
+        assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED);
+    }
+
+    /// @notice Direct regression test named in the build strategy: a dispute opened one block before window
+    ///         expiry keeps the slot locked regardless of remaining window time.
+    function test_DisputeOpenedOneBlockBeforeExpiryStillBlocksFinalization() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0);
+
+        vm.warp(block.timestamp + WINDOW - 1);
+        vm.prank(controller);
+        lm.markDisputed(listingId, 0);
+
+        vm.warp(block.timestamp + 2); // now past the original deadline
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotPaymentConfirmed.selector, listingId, 0));
+        lm.finalizeExpiredSlot(listingId, 0);
+    }
+
+    // ── markDisputed / resolveDispute ──────────────────────────────────────────────────────────────────────────
+
+    function test_MarkDisputedRevertsWhenNotController() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0);
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.NotController.selector, stranger));
+        lm.markDisputed(listingId, 0);
+    }
+
+    /// @notice A resolved slot is always permanently spent (Removed), never recycled back to Empty - whatever
+    ///         backed it was already unlocked or slashed by DisputeManager before this call, so there is nothing
+    ///         left to reuse without a fresh lock. This holds regardless of whether the listing is still open.
+    function test_ResolveDisputeAlwaysMarksSlotRemovedNeverEmpty() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.startPrank(controller);
+        lm.confirmPayment(listingId, 0);
+        lm.markDisputed(listingId, 0);
+        lm.resolveDispute(listingId, 0);
+        vm.stopPrank();
+
+        (ListingManager.SlotStatus status,) = lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
+        (,,, uint256 emptySlots,,,) = lm.listings(listingId);
+        assertEq(emptySlots, 0); // Removed does not count as reusable capacity
+    }
+
+    function test_ResolveDisputeOnClosedListingAlsoMarksRemoved() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0);
+        vm.prank(seller);
+        lm.closeListing(listingId); // no empty slots to release yet, but blocks future reuse
+
+        vm.startPrank(controller);
+        lm.markDisputed(listingId, 0);
+        lm.resolveDispute(listingId, 0);
+        vm.stopPrank();
+
+        (ListingManager.SlotStatus status,) = lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
+        (,,, uint256 emptySlots,,,) = lm.listings(listingId);
+        assertEq(emptySlots, 0);
+    }
+
+    function test_ResolveDisputeRevertsWhenNotDisputed() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotDisputed.selector, listingId, 0));
+        lm.resolveDispute(listingId, 0);
+    }
+
+    // ── reduceSlots / closeListing ─────────────────────────────────────────────────────────────────────────────
+
+    function test_ReduceSlotsReleasesOnlyEmptySlots() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 3, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0); // slot 0 now occupied; slots 1,2 still empty
+
+        vm.prank(seller);
+        lm.reduceSlots(listingId, 2);
+
+        (,,, uint256 emptySlots,,,) = lm.listings(listingId);
+        assertEq(emptySlots, 0);
+        assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED * 3 + PER_SLOT_LOCKED * 2);
+
+        (ListingManager.SlotStatus s1,) = lm.slots(listingId, 1);
+        (ListingManager.SlotStatus s2,) = lm.slots(listingId, 2);
+        assertEq(uint8(s1), uint8(ListingManager.SlotStatus.Removed));
+        assertEq(uint8(s2), uint8(ListingManager.SlotStatus.Removed));
+    }
+
+    /// @notice Direct regression test for the adversarial scenario the build strategy calls out: a slot whose
+    ///         payment is confirmed can never be reclaimed by reduce/close, regardless of how the seller asks.
+    function test_ReduceSlotsCannotTouchAConfirmedSlotEvenIfRequestedCountWouldReachIt() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 2, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0); // 1 empty slot remains (index 1)
+
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.InsufficientEmptySlots.selector, listingId, 2, 1));
+        lm.reduceSlots(listingId, 2); // asking for both is impossible - slot 0 is confirmed, not empty
+
+        (ListingManager.SlotStatus s0,) = lm.slots(listingId, 0);
+        assertEq(uint8(s0), uint8(ListingManager.SlotStatus.PaymentConfirmed)); // untouched
+    }
+
+    function test_ReduceSlotsRevertsWhenNotSeller() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.NotSeller.selector, stranger, seller));
+        lm.reduceSlots(listingId, 1);
+    }
+
+    function test_CloseListingReleasesEmptySlotsAndBlocksFutureConfirm() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 2, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0); // 1 confirmed, 1 empty
+
+        vm.prank(seller);
+        lm.closeListing(listingId);
+
+        (,,,,,, bool closed) = lm.listings(listingId);
+        assertTrue(closed);
+        assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED * 2 + PER_SLOT_LOCKED); // slot 1 released
+
+        vm.prank(controller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.ListingAlreadyClosed.selector, listingId));
+        lm.confirmPayment(listingId, 1);
+
+        // the still-confirmed slot 0 continues its normal lifecycle untouched
+        vm.warp(block.timestamp + WINDOW);
+        lm.finalizeExpiredSlot(listingId, 0);
+        assertEq(bond.freeIB(seller), 100 ether); // fully released once slot 0 also resolves
+        (ListingManager.SlotStatus s0,) = lm.slots(listingId, 0);
+        assertEq(uint8(s0), uint8(ListingManager.SlotStatus.Removed)); // spent, not recycled to Empty
+    }
+
+    function test_CloseListingRevertsWhenAlreadyClosed() public {
+        vm.startPrank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        lm.closeListing(listingId);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.ListingAlreadyClosed.selector, listingId));
+        lm.closeListing(listingId);
+        vm.stopPrank();
+    }
+
+    // ── Fuzz ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+    function testFuzz_CreateThenFullyReduceRoundTripsExactly(uint256 price, uint256 totalSlots) public {
+        // A fresh, unfunded seller - `seller` from setUp() already carries a 100 ether deposit, which would
+        // otherwise contaminate the "fully recovered, exactly" assertions below.
+        address freshSeller = makeAddr("freshSeller");
+        price = bound(price, 1, 1_000_000 ether);
+        totalSlots = bound(totalSlots, 1, lm.MAX_SLOTS());
+        uint256 perSlot = (price * 3 + 1) / 2; // ceilDiv mirrored for the assertion
+        uint256 required = perSlot * totalSlots;
+
+        vm.deal(freshSeller, required);
+        vm.prank(freshSeller);
+        bond.deposit{value: required}();
+
+        vm.prank(freshSeller);
+        uint256 listingId = lm.createListing(price, totalSlots, WINDOW);
+        assertEq(bond.freeIB(freshSeller), 0);
+
+        vm.prank(freshSeller);
+        lm.closeListing(listingId);
+        assertEq(bond.freeIB(freshSeller), required); // fully recovered, no dust left behind
+    }
+
+    function testFuzz_ConfirmedSlotSurvivesArbitraryReduceRequests(uint256 totalSlots, uint256 confirmCount) public {
+        totalSlots = bound(totalSlots, 1, 50);
+        confirmCount = bound(confirmCount, 1, totalSlots);
+
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, totalSlots, WINDOW);
+        vm.startPrank(controller);
+        for (uint256 i = 0; i < confirmCount; i++) {
+            lm.confirmPayment(listingId, i);
+        }
+        vm.stopPrank();
+
+        (,,, uint256 emptySlots,,,) = lm.listings(listingId);
+        assertEq(emptySlots, totalSlots - confirmCount);
+
+        vm.prank(seller);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ListingManager.InsufficientEmptySlots.selector, listingId, totalSlots, totalSlots - confirmCount
+            )
+        );
+        lm.reduceSlots(listingId, totalSlots); // requesting all N must fail whenever any slot is confirmed
+
+        for (uint256 i = 0; i < confirmCount; i++) {
+            (ListingManager.SlotStatus s,) = lm.slots(listingId, i);
+            assertEq(uint8(s), uint8(ListingManager.SlotStatus.PaymentConfirmed));
+        }
+    }
+}
