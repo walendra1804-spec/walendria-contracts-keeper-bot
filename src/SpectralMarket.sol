@@ -28,7 +28,17 @@ import {ISettlementConditionsHook} from "./ISettlementConditionsHook.sol";
 ///      per-market. LMSR's own well-known bounded-loss property (a market maker can owe up to `b * ln(2)` more in
 ///      redemptions than it collected) means `pooled` is not guaranteed sufficient to cover every redemption in
 ///      every adversarial trading sequence; the spec's own backstop for this (Section 2.6.7's Protocol Liquidity
-///      Buffer, funded from the Developer Pool) is out of scope here - Phase 8 wires DeveloperPool.sol.
+///      Buffer, funded from the Developer Pool) is wired in Phase 8 via DisputeManager crediting DeveloperPool.sol
+///      as an extra symmetric contributor in {openMarket} - this contract has no special-case logic for it, it is
+///      just another address in the arrays below.
+///
+///      Phase 8 also generalizes the Innocent side of {openMarket} from a single recipient to arrays, mirroring
+///      the Guilty side: the liquidity buffer needs to credit DeveloperPool.sol on *both* sides simultaneously
+///      (Section 2.6.7's "split exactly 50/50"), which the original single-recipient Innocent side couldn't
+///      express. Phase 8 also adds {sweepSurplus} (Section 2.6.6): the difference between a resolved market's
+///      pooled funds and its remaining winning-side obligation is a constant quantity from the moment of
+///      resolution onward (both shrink by exactly the redeemed amount per {redeem} call), so it can be swept to
+///      the Developer Pool at any time after resolution, by anyone, without waiting for every winner to redeem.
 contract SpectralMarket is ReentrancyGuard {
     enum Side {
         Guilty,
@@ -60,6 +70,11 @@ contract SpectralMarket is ReentrancyGuard {
     mapping(uint256 marketId => mapping(Side => uint256)) public distinctHolderCount;
     mapping(uint256 marketId => mapping(Side => mapping(address trader => bool))) public everHeldShares;
 
+    /// @notice Cumulative amount paid out via {redeem} for `marketId`, tracked so {sweepSurplus} can compute the
+    ///         still-outstanding winning obligation at any time after resolution, not just at the instant of
+    ///         resolution itself.
+    mapping(uint256 marketId => uint256) public totalRedeemed;
+
     /// @notice Called after every successful {buy}/{sell} (Section 2.6.8's checkpoint-on-trade). Address(0) is a
     ///         valid, deliberate choice meaning "no condition tracking wired in" - useful for isolating pure
     ///         market-mechanics tests from Phase 6's resolution-condition concerns; a real deployment must wire
@@ -67,11 +82,16 @@ contract SpectralMarket is ReentrancyGuard {
     ///         (direct controller-gated {resolveMarket} calls, e.g. DisputeManager's mutualClose, still work).
     ISettlementConditionsHook public immutable settlementConditions;
 
+    /// @notice Destination for {sweepSurplus} (Section 2.6.6). Address(0) is a valid, deliberate choice disabling
+    ///         sweeping - same rationale as {settlementConditions}'s address(0) state.
+    address public immutable developerPool;
+
     event MarketOpened(uint256 indexed marketId, uint256 b, uint256 sharesPerSide, uint256 totalPooled);
     event Bought(uint256 indexed marketId, Side indexed side, address indexed trader, uint256 shares, uint256 cost);
     event Sold(uint256 indexed marketId, Side indexed side, address indexed trader, uint256 shares, uint256 proceeds);
     event MarketResolved(uint256 indexed marketId, Side winningSide);
     event Redeemed(uint256 indexed marketId, address indexed trader, uint256 shares, uint256 payout);
+    event SurplusSwept(uint256 indexed marketId, uint256 amount);
 
     error NoControllers();
     error NotController(address caller);
@@ -82,7 +102,7 @@ contract SpectralMarket is ReentrancyGuard {
     error MarketNotResolved(uint256 marketId);
     error EmptyContributionList();
     error ContributionArrayLengthMismatch(uint256 fundersLength, uint256 amountsLength);
-    error MismatchedInitialContributions(uint256 guiltyTotal, uint256 innocentAmount);
+    error MismatchedInitialContributions(uint256 guiltyTotal, uint256 innocentTotal);
     error IncorrectValueSent(uint256 sent, uint256 required);
     error ZeroShares();
     error BuySlippageExceeded(uint256 cost, uint256 maxCost);
@@ -90,17 +110,21 @@ contract SpectralMarket is ReentrancyGuard {
     error InsufficientShares(address trader, uint256 requested, uint256 held);
     error NothingToRedeem(address trader);
     error TransferFailed(address to, uint256 amount);
+    error DeveloperPoolNotSet();
+    error NoSurplusToSweep(uint256 marketId);
 
     /// @param controllers Addresses authorized to call {openMarket}/{resolveMarket} (e.g. DisputeManager.sol,
     ///        SettlementConditions.sol). Fixed for the lifetime of this contract.
     /// @param _settlementConditions See {settlementConditions}. Immutable, like every other cross-contract
     ///        address in this codebase - address(0) disables the hook (see {settlementConditions}'s doc).
-    constructor(address[] memory controllers, ISettlementConditionsHook _settlementConditions) {
+    /// @param _developerPool See {developerPool}. Immutable - address(0) disables {sweepSurplus}.
+    constructor(address[] memory controllers, ISettlementConditionsHook _settlementConditions, address _developerPool) {
         if (controllers.length == 0) revert NoControllers();
         for (uint256 i = 0; i < controllers.length; i++) {
             isController[controllers[i]] = true;
         }
         settlementConditions = _settlementConditions;
+        developerPool = _developerPool;
     }
 
     modifier onlyController() {
@@ -111,14 +135,17 @@ contract SpectralMarket is ReentrancyGuard {
     /// @notice Opens `marketId` with liquidity parameter `b` (Section 2.6.4; locked parameter: b = 1 * P per
     ///         disputed transaction) and performs the joint initial-position injection (Section 2.6.1):
     ///         `guiltyFunders`/`guiltyAmounts` are credited Guilty shares in proportion to their contribution,
-    ///         `innocentRecipient` (the seller) is credited Innocent shares for `innocentAmount` (the matching
-    ///         0.5P IB draw). Both sides are resolved as a single simultaneous state transition from (0, 0), so
-    ///         the market opens at an unbiased 50/50 price regardless of the order the underlying contributions
-    ///         landed in (Section 2.6.4's path independence).
+    ///         `innocentRecipients`/`innocentAmounts` are credited Innocent shares the same way - ordinarily just
+    ///         the seller (the matching 0.5P IB draw), but Phase 8 also lets DeveloperPool.sol appear on *both*
+    ///         arrays simultaneously when Section 2.6.7's liquidity buffer tops up a small-P dispute. All
+    ///         contributions are resolved as a single simultaneous state transition from (0, 0), so the market
+    ///         opens at an unbiased 50/50 price regardless of the order the underlying contributions landed in
+    ///         (Section 2.6.4's path independence).
     ///
-    ///         Requires `sum(guiltyAmounts) == innocentAmount` (Section 2.4: the seller's match is always equal
-    ///         to the Guilty-side funding that triggered it). Given that precondition, moving symmetrically from
-    ///         (0, 0) to (q, q) costs exactly `q` regardless of `b` - see {LMSRMath-cost}: C(q,q) - C(0,0) =
+    ///         Requires `sum(guiltyAmounts) == sum(innocentAmounts)` (Section 2.4: the seller's match is always
+    ///         equal to the Guilty-side funding that triggered it; a buffer top-up preserves this by contributing
+    ///         the identical amount to both arrays). Given that precondition, moving symmetrically from (0, 0) to
+    ///         (q, q) costs exactly `q` regardless of `b` - see {LMSRMath-cost}: C(q,q) - C(0,0) =
     ///         b*ln(2*e^(q/b)) - b*ln(2) = q. So every contributor's shares are simply twice their dollar
     ///         contribution (the unbiased opening price is exactly 0.5): no LMSRMath call is needed to *solve*
     ///         for shares here, only to verify the identity (done in SpectralMarketTest, cross-checked against
@@ -131,24 +158,25 @@ contract SpectralMarket is ReentrancyGuard {
         uint256 b,
         address[] calldata guiltyFunders,
         uint256[] calldata guiltyAmounts,
-        address innocentRecipient,
-        uint256 innocentAmount
+        address[] calldata innocentRecipients,
+        uint256[] calldata innocentAmounts
     ) external payable onlyController {
         Market storage m = markets[marketId];
         if (m.open) revert MarketAlreadyOpen(marketId);
         if (b == 0) revert ZeroLiquidityParameter();
-        if (guiltyFunders.length == 0) revert EmptyContributionList();
+        if (guiltyFunders.length == 0 || innocentRecipients.length == 0) revert EmptyContributionList();
         if (guiltyFunders.length != guiltyAmounts.length) {
             revert ContributionArrayLengthMismatch(guiltyFunders.length, guiltyAmounts.length);
         }
-
-        uint256 guiltyTotal;
-        for (uint256 i = 0; i < guiltyAmounts.length; i++) {
-            guiltyTotal += guiltyAmounts[i];
+        if (innocentRecipients.length != innocentAmounts.length) {
+            revert ContributionArrayLengthMismatch(innocentRecipients.length, innocentAmounts.length);
         }
-        if (guiltyTotal != innocentAmount) revert MismatchedInitialContributions(guiltyTotal, innocentAmount);
 
-        uint256 totalIn = guiltyTotal + innocentAmount;
+        uint256 guiltyTotal = _sumAmounts(guiltyAmounts);
+        uint256 innocentTotal = _sumAmounts(innocentAmounts);
+        if (guiltyTotal != innocentTotal) revert MismatchedInitialContributions(guiltyTotal, innocentTotal);
+
+        uint256 totalIn = guiltyTotal + innocentTotal;
         if (msg.value != totalIn) revert IncorrectValueSent(msg.value, totalIn);
 
         // casting to 'int256' is safe because totalIn is a native-currency wei amount, unreachably far below
@@ -163,12 +191,8 @@ contract SpectralMarket is ReentrancyGuard {
         m.pooled = totalIn;
         m.open = true;
 
-        for (uint256 i = 0; i < guiltyFunders.length; i++) {
-            _markHolder(marketId, Side.Guilty, guiltyFunders[i]);
-            sharesOf[marketId][Side.Guilty][guiltyFunders[i]] += guiltyAmounts[i] * 2;
-        }
-        _markHolder(marketId, Side.Innocent, innocentRecipient);
-        sharesOf[marketId][Side.Innocent][innocentRecipient] += innocentAmount * 2;
+        _creditSide(marketId, Side.Guilty, guiltyFunders, guiltyAmounts);
+        _creditSide(marketId, Side.Innocent, innocentRecipients, innocentAmounts);
 
         emit MarketOpened(marketId, b, totalIn, totalIn);
     }
@@ -284,11 +308,39 @@ contract SpectralMarket is ReentrancyGuard {
         sharesOf[marketId][m.winningSide][msg.sender] = 0;
         payout = shares;
         m.pooled -= payout;
+        totalRedeemed[marketId] += payout;
 
         emit Redeemed(marketId, msg.sender, shares, payout);
 
         (bool ok,) = msg.sender.call{value: payout}("");
         if (!ok) revert TransferFailed(msg.sender, payout);
+    }
+
+    /// @notice Sweeps `marketId`'s surplus (Section 2.6.6) to {developerPool}: the difference between pooled
+    ///         funds and the still-outstanding winning-side obligation. This quantity is constant from the moment
+    ///         of resolution onward - both `pooled` and the remaining obligation shrink by exactly the same
+    ///         amount on every {redeem} call - so it is safe to call at any time after resolution, by anyone,
+    ///         repeatedly (later calls simply find zero surplus once a prior sweep already collected it, or once
+    ///         trading losses fully absorbed by winners leave nothing left over).
+    function sweepSurplus(uint256 marketId) external nonReentrant returns (uint256 surplus) {
+        if (developerPool == address(0)) revert DeveloperPoolNotSet();
+        Market storage m = markets[marketId];
+        if (!m.resolved) revert MarketNotResolved(marketId);
+
+        SD59x18 winningQtyFixed = m.winningSide == Side.Guilty ? m.qGuilty : m.qInnocent;
+        // casting to 'uint256' is safe because share quantities never go negative (they only ever accumulate
+        // non-negative credits - see {SpectralMarket-distinctHolderCount}'s neighboring invariants).
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 winningQty = uint256(SD59x18.unwrap(winningQtyFixed));
+        uint256 remainingObligation = winningQty - totalRedeemed[marketId];
+        if (m.pooled <= remainingObligation) revert NoSurplusToSweep(marketId);
+        surplus = m.pooled - remainingObligation;
+
+        m.pooled -= surplus;
+        emit SurplusSwept(marketId, surplus);
+
+        (bool ok,) = developerPool.call{value: surplus}("");
+        if (!ok) revert TransferFailed(developerPool, surplus);
     }
 
     /// @notice Current marginal Guilty/Innocent price for `marketId` (Section 2.6.4), exposed for
@@ -321,6 +373,25 @@ contract SpectralMarket is ReentrancyGuard {
             m.resolved = true;
             m.winningSide = guiltyWins ? Side.Guilty : Side.Innocent;
             emit MarketResolved(marketId, m.winningSide);
+        }
+    }
+
+    /// @dev Extracted out of {openMarket} to keep its own stack depth within Solidity's limit now that both
+    ///      sides are arrays - this and {_creditSide} carry the per-array loop variables instead.
+    function _sumAmounts(uint256[] calldata amounts) private pure returns (uint256 total) {
+        for (uint256 i = 0; i < amounts.length; i++) {
+            total += amounts[i];
+        }
+    }
+
+    /// @dev Credits `side` shares to each of `recipients` in proportion to `amounts` (2x, per {openMarket}'s
+    ///      unbiased-50/50-opening identity), marking each as a holder for {distinctHolderCount}.
+    function _creditSide(uint256 marketId, Side side, address[] calldata recipients, uint256[] calldata amounts)
+        private
+    {
+        for (uint256 i = 0; i < recipients.length; i++) {
+            _markHolder(marketId, side, recipients[i]);
+            sharesOf[marketId][side][recipients[i]] += amounts[i] * 2;
         }
     }
 

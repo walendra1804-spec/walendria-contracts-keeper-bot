@@ -44,8 +44,13 @@ contract SpectralMarketHandler is Test {
             remaining -= amounts[i];
         }
 
+        address[] memory innocentRecipients = new address[](1);
+        innocentRecipients[0] = seller;
+        uint256[] memory innocentAmounts = new uint256[](1);
+        innocentAmounts[0] = halfP;
+
         vm.prank(controller);
-        market.openMarket{value: halfP * 2}(marketId, b, funders, amounts, seller, halfP);
+        market.openMarket{value: halfP * 2}(marketId, b, funders, amounts, innocentRecipients, innocentAmounts);
 
         marketIds.push(marketId);
         for (uint256 i = 0; i < funderCount; i++) {

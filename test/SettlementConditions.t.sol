@@ -37,7 +37,7 @@ contract SettlementConditionsTest is Test {
         address[] memory controllers = new address[](2);
         controllers[0] = controller;
         controllers[1] = address(conditions);
-        market = new SpectralMarket(controllers, ISettlementConditionsHook(address(conditions)));
+        market = new SpectralMarket(controllers, ISettlementConditionsHook(address(conditions)), address(0));
         assertEq(address(market), predictedMarket, "CREATE nonce prediction drifted");
 
         vm.deal(controller, 1000 ether);
@@ -50,7 +50,7 @@ contract SettlementConditionsTest is Test {
         uint256[] memory amounts = new uint256[](1);
         amounts[0] = HALF_P;
         vm.prank(controller);
-        market.openMarket{value: P}(MARKET_ID, B, funders, amounts, seller, HALF_P);
+        market.openMarket{value: P}(MARKET_ID, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
     }
 
     /// @dev delta = b * ln(p / (1-p)): the Guilty-share quantity that pushes price from the market's symmetric
@@ -66,6 +66,16 @@ contract SettlementConditionsTest is Test {
 
     function _isResolved(uint256 marketId) internal view returns (bool resolved, SpectralMarket.Side winningSide) {
         (,,,,, resolved, winningSide) = market.markets(marketId);
+    }
+
+    function _singleton(address a) internal pure returns (address[] memory arr) {
+        arr = new address[](1);
+        arr[0] = a;
+    }
+
+    function _singletonAmt(uint256 v) internal pure returns (uint256[] memory arr) {
+        arr = new uint256[](1);
+        arr[0] = v;
     }
 
     // ── Constructor ────────────────────────────────────────────────────────────────────────────────────────────
@@ -316,7 +326,7 @@ contract SettlementConditionsTest is Test {
         uint256[] memory amounts = new uint256[](1);
         amounts[0] = HALF_P;
         vm.prank(controller);
-        market.openMarket{value: P}(2, B, funders, amounts, seller, HALF_P);
+        market.openMarket{value: P}(2, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
 
         uint256 sharesToReach88 = _sharesToReachPrice(B, 0.88e18);
         vm.prank(buyer);

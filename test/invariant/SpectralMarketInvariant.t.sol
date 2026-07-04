@@ -17,7 +17,7 @@ contract SpectralMarketInvariantTest is Test {
     function setUp() public {
         address[] memory controllers = new address[](1);
         controllers[0] = controller;
-        market = new SpectralMarket(controllers, ISettlementConditionsHook(address(0)));
+        market = new SpectralMarket(controllers, ISettlementConditionsHook(address(0)), address(0));
 
         for (uint256 i = 0; i < 4; i++) {
             traders.push(makeAddr(string.concat("invTrader", vm.toString(i))));

@@ -8,6 +8,7 @@ import {ListingManager} from "../src/ListingManager.sol";
 import {SpectralMarket} from "../src/SpectralMarket.sol";
 import {ISettlementConditionsHook} from "../src/ISettlementConditionsHook.sol";
 import {LMSRMath} from "../src/LMSRMath.sol";
+import {DeveloperPool} from "../src/DeveloperPool.sol";
 import {DisputeManager} from "../src/DisputeManager.sol";
 
 /// @dev Reenters `dm` with an arbitrary, test-configured calldata payload during its own `receive()`, mirroring
@@ -115,10 +116,10 @@ contract DisputeManagerTest is Test {
         address[] memory marketControllers = new address[](2);
         marketControllers[0] = priceController;
         marketControllers[1] = predictedDm;
-        market = new SpectralMarket(marketControllers, ISettlementConditionsHook(address(0)));
+        market = new SpectralMarket(marketControllers, ISettlementConditionsHook(address(0)), address(0));
         assertEq(address(market), predictedMarket, "CREATE nonce prediction drifted (market)");
 
-        dm = new DisputeManager(lm, bond, market);
+        dm = new DisputeManager(lm, bond, market, DeveloperPool(payable(address(0))));
         assertEq(address(dm), predictedDm, "CREATE nonce prediction drifted (dm)");
 
         vm.deal(seller, 1000 ether);
@@ -834,5 +835,168 @@ contract DisputeManagerTest is Test {
         vm.prank(oneTooMany);
         vm.expectRevert(abi.encodeWithSelector(DisputeManager.TooManyGuiltyFunders.selector, max, max));
         dm.fundGuiltySide{value: 1}(listingId, 0);
+    }
+}
+
+/// @notice Section 2.6.7's Protocol Liquidity Buffer, exercised through a real DeveloperPool wired into
+///         DisputeManager - the main DisputeManagerTest above deliberately disables this (developerPool =
+///         address(0)) to isolate the rest of the contract's behavior from it.
+contract DisputeManagerLiquidityBufferTest is Test {
+    IntegrityBond internal bond;
+    ListingManager internal lm;
+    SpectralMarket internal market;
+    DeveloperPool internal devPool;
+    DisputeManager internal dm;
+
+    address internal settlementStandIn = makeAddr("bufferSettlementStandIn");
+    address internal priceController = makeAddr("bufferPriceController");
+    address internal developer = makeAddr("bufferDeveloper");
+    address internal withdrawalRecipient = makeAddr("bufferWithdrawalRecipient");
+    address internal seller = makeAddr("bufferSeller");
+    address internal buyer = makeAddr("bufferBuyer");
+
+    uint256 internal constant WINDOW = 72 hours;
+
+    function setUp() public {
+        uint256 nonce = vm.getNonce(address(this));
+        address predictedLm = vm.computeCreateAddress(address(this), nonce + 1);
+        address predictedDm = vm.computeCreateAddress(address(this), nonce + 4);
+
+        address[] memory bondControllers = new address[](2);
+        bondControllers[0] = predictedLm;
+        bondControllers[1] = predictedDm;
+        bond = new IntegrityBond(bondControllers);
+
+        address[] memory lmControllers = new address[](2);
+        lmControllers[0] = settlementStandIn;
+        lmControllers[1] = predictedDm;
+        lm = new ListingManager(bond, lmControllers);
+        assertEq(address(lm), predictedLm, "CREATE nonce prediction drifted (lm)");
+
+        address[] memory devPoolControllers = new address[](1);
+        devPoolControllers[0] = predictedDm;
+        devPool = new DeveloperPool(developer, withdrawalRecipient, devPoolControllers);
+
+        address[] memory marketControllers = new address[](2);
+        marketControllers[0] = priceController;
+        marketControllers[1] = predictedDm;
+        market = new SpectralMarket(marketControllers, ISettlementConditionsHook(address(0)), address(devPool));
+
+        dm = new DisputeManager(lm, bond, market, devPool);
+        assertEq(address(dm), predictedDm, "CREATE nonce prediction drifted (dm)");
+
+        vm.deal(seller, 1000 ether);
+        vm.prank(seller);
+        bond.deposit{value: 100 ether}();
+        vm.deal(buyer, 1000 ether);
+    }
+
+    function _openConfirmedListing(uint256 price) internal returns (uint256 listingId) {
+        vm.prank(seller);
+        listingId = lm.createListing(price, 1, WINDOW);
+        vm.prank(settlementStandIn);
+        lm.confirmPayment(listingId, 0, buyer);
+    }
+
+    /// @notice A dispute whose 1P-total initial depth is below the $5-equivalent floor gets topped up to exactly
+    ///         that floor, split symmetrically, with DeveloperPool.sol credited on both sides.
+    function test_SmallPriceDisputeGetsToppedUpToMinLiquidityDepth() public {
+        vm.deal(address(devPool), 10 ether);
+        uint256 price = 1 ether; // 1P total = 1 ether, below the 5e18 floor
+        uint256 listingId = _openConfirmedListing(price);
+        uint256 marketId = dm.marketIdOf(listingId, 0);
+
+        vm.prank(buyer);
+        dm.fundGuiltySide{value: price / 2}(listingId, 0);
+
+        (, SD59x18 qGuilty, SD59x18 qInnocent,, bool open,,) = market.markets(marketId);
+        assertTrue(open);
+        assertEq(
+            uint256(SD59x18.unwrap(qGuilty)),
+            dm.MIN_LIQUIDITY_DEPTH(),
+            "depth must be topped up to exactly $5-equivalent"
+        );
+        assertEq(uint256(SD59x18.unwrap(qInnocent)), dm.MIN_LIQUIDITY_DEPTH());
+
+        uint256 expectedPerSide = (dm.MIN_LIQUIDITY_DEPTH() - price) / 2;
+        assertEq(market.sharesOf(marketId, SpectralMarket.Side.Guilty, address(devPool)), expectedPerSide * 2);
+        assertEq(market.sharesOf(marketId, SpectralMarket.Side.Innocent, address(devPool)), expectedPerSide * 2);
+    }
+
+    function test_LargePriceDisputeGetsNoTopUp() public {
+        vm.deal(address(devPool), 10 ether);
+        uint256 price = 10 ether; // 1P total = 10 ether, already above the 5e18 floor
+        uint256 listingId = _openConfirmedListing(price);
+        uint256 marketId = dm.marketIdOf(listingId, 0);
+
+        vm.prank(buyer);
+        dm.fundGuiltySide{value: price / 2}(listingId, 0);
+
+        (, SD59x18 qGuilty,,,,,) = market.markets(marketId);
+        assertEq(uint256(SD59x18.unwrap(qGuilty)), price, "no top-up expected; depth already clears the floor");
+        assertEq(market.sharesOf(marketId, SpectralMarket.Side.Guilty, address(devPool)), 0);
+    }
+
+    /// @notice An underfunded DeveloperPool degrades the top-up gracefully rather than blocking the dispute from
+    ///         opening at all - mirroring SettlementConditions' poke-bounty degradation and DeveloperPool's own
+    ///         pullLiquidityBuffer capping.
+    function test_UnderfundedDeveloperPoolGivesPartialTopUpAndStillOpens() public {
+        uint256 price = 1 ether;
+        uint256 desiredPerSide = (5 ether - price) / 2;
+        uint256 availableInPool = desiredPerSide / 2; // deliberately less than what's desired
+        vm.deal(address(devPool), availableInPool);
+
+        uint256 listingId = _openConfirmedListing(price);
+        uint256 marketId = dm.marketIdOf(listingId, 0);
+
+        vm.prank(buyer);
+        dm.fundGuiltySide{value: price / 2}(listingId, 0);
+
+        (,,,, bool open,,) = market.markets(marketId);
+        assertTrue(open, "an underfunded buffer must never block the dispute from opening");
+        // DisputeManager requests 2x desiredPerSide (since the top-up is credited on both sides), DevPool sends
+        // only its full available balance (`availableInPool`), and that gets split back in half per side - so
+        // the shares credited on one side are exactly `availableInPool` (perSide * 2 = (availableInPool/2) * 2).
+        assertEq(
+            market.sharesOf(marketId, SpectralMarket.Side.Guilty, address(devPool)),
+            availableInPool,
+            "top-up shrinks to whatever DeveloperPool actually had, split across both sides"
+        );
+        assertEq(address(devPool).balance, 0);
+    }
+
+    function test_EmptyDeveloperPoolGivesNoTopUpAndStillOpens() public {
+        uint256 price = 1 ether; // devPool starts at zero balance - never funded in this test
+        uint256 listingId = _openConfirmedListing(price);
+        uint256 marketId = dm.marketIdOf(listingId, 0);
+
+        vm.prank(buyer);
+        dm.fundGuiltySide{value: price / 2}(listingId, 0);
+
+        (, SD59x18 qGuilty,,, bool open,,) = market.markets(marketId);
+        assertTrue(open);
+        assertEq(uint256(SD59x18.unwrap(qGuilty)), price);
+        assertEq(market.sharesOf(marketId, SpectralMarket.Side.Guilty, address(devPool)), 0);
+    }
+
+    /// @notice Direct regression test: once DeveloperPool has real capital staked on both sides from a buffer
+    ///         top-up, it is a genuine third party at risk in the outcome - mutualClose must permanently disable,
+    ///         exactly as it would for any other third-party backer (Phase 7).
+    function test_LiquidityBufferTopUpDisablesMutualClose() public {
+        vm.deal(address(devPool), 10 ether);
+        uint256 price = 1 ether;
+        uint256 listingId = _openConfirmedListing(price);
+        uint256 marketId = dm.marketIdOf(listingId, 0);
+
+        vm.prank(buyer);
+        dm.fundGuiltySide{value: price / 2}(listingId, 0);
+
+        vm.prank(buyer);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                DisputeManager.ThirdPartyParticipation.selector, marketId, SpectralMarket.Side.Guilty
+            )
+        );
+        dm.mutualClose(listingId, 0, SpectralMarket.Side.Innocent);
     }
 }

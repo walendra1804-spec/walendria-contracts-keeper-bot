@@ -62,7 +62,7 @@ contract SpectralMarketTest is Test {
     function setUp() public {
         address[] memory controllers = new address[](1);
         controllers[0] = controller;
-        market = new SpectralMarket(controllers, ISettlementConditionsHook(address(0)));
+        market = new SpectralMarket(controllers, ISettlementConditionsHook(address(0)), address(0));
         vm.deal(controller, 1000 ether);
         vm.deal(guilty1, 1000 ether);
         vm.deal(guilty2, 1000 ether);
@@ -77,14 +77,24 @@ contract SpectralMarketTest is Test {
         amounts[0] = HALF_P;
 
         vm.prank(controller);
-        market.openMarket{value: P}(marketId, B, funders, amounts, seller, HALF_P);
+        market.openMarket{value: P}(marketId, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
+    }
+
+    function _singleton(address a) internal pure returns (address[] memory arr) {
+        arr = new address[](1);
+        arr[0] = a;
+    }
+
+    function _singletonAmt(uint256 v) internal pure returns (uint256[] memory arr) {
+        arr = new uint256[](1);
+        arr[0] = v;
     }
 
     // ── Constructor ────────────────────────────────────────────────────────────────────────────────────────────
 
     function test_ConstructorRevertsOnEmptyControllers() public {
         vm.expectRevert(SpectralMarket.NoControllers.selector);
-        new SpectralMarket(new address[](0), ISettlementConditionsHook(address(0)));
+        new SpectralMarket(new address[](0), ISettlementConditionsHook(address(0)), address(0));
     }
 
     // ── openMarket ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -104,7 +114,7 @@ contract SpectralMarketTest is Test {
         amounts[1] = 0.2 ether; // sums to HALF_P
 
         vm.prank(controller);
-        market.openMarket{value: P}(1, B, funders, amounts, seller, HALF_P);
+        market.openMarket{value: P}(1, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
 
         assertEq(market.sharesOf(1, SpectralMarket.Side.Guilty, guilty1), 0.6 ether);
         assertEq(market.sharesOf(1, SpectralMarket.Side.Guilty, guilty2), 0.4 ether);
@@ -127,7 +137,7 @@ contract SpectralMarketTest is Test {
         amountsA[0] = 0.3 ether;
         amountsA[1] = 0.2 ether;
         vm.prank(controller);
-        market.openMarket{value: P}(1, B, fundersA, amountsA, seller, HALF_P);
+        market.openMarket{value: P}(1, B, fundersA, amountsA, _singleton(seller), _singletonAmt(HALF_P));
 
         // Market 2: same funders/amounts, opposite array order.
         address[] memory fundersB = new address[](2);
@@ -137,7 +147,7 @@ contract SpectralMarketTest is Test {
         amountsB[0] = 0.2 ether;
         amountsB[1] = 0.3 ether;
         vm.prank(controller);
-        market.openMarket{value: P}(2, B, fundersB, amountsB, seller, HALF_P);
+        market.openMarket{value: P}(2, B, fundersB, amountsB, _singleton(seller), _singletonAmt(HALF_P));
 
         assertEq(
             market.sharesOf(1, SpectralMarket.Side.Guilty, guilty1),
@@ -180,7 +190,7 @@ contract SpectralMarketTest is Test {
         amounts[0] = HALF_P;
         vm.prank(controller);
         vm.expectRevert(abi.encodeWithSelector(SpectralMarket.MarketAlreadyOpen.selector, 1));
-        market.openMarket{value: P}(1, B, funders, amounts, seller, HALF_P);
+        market.openMarket{value: P}(1, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
     }
 
     function test_OpenMarketRevertsOnZeroLiquidityParameter() public {
@@ -190,13 +200,13 @@ contract SpectralMarketTest is Test {
         amounts[0] = HALF_P;
         vm.prank(controller);
         vm.expectRevert(SpectralMarket.ZeroLiquidityParameter.selector);
-        market.openMarket{value: P}(1, 0, funders, amounts, seller, HALF_P);
+        market.openMarket{value: P}(1, 0, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
     }
 
     function test_OpenMarketRevertsOnEmptyContributionList() public {
         vm.prank(controller);
         vm.expectRevert(SpectralMarket.EmptyContributionList.selector);
-        market.openMarket{value: 0}(1, B, new address[](0), new uint256[](0), seller, 0);
+        market.openMarket{value: 0}(1, B, new address[](0), new uint256[](0), _singleton(seller), _singletonAmt(0));
     }
 
     function test_OpenMarketRevertsOnArrayLengthMismatch() public {
@@ -207,7 +217,7 @@ contract SpectralMarketTest is Test {
         amounts[0] = HALF_P;
         vm.prank(controller);
         vm.expectRevert(abi.encodeWithSelector(SpectralMarket.ContributionArrayLengthMismatch.selector, 2, 1));
-        market.openMarket{value: HALF_P}(1, B, funders, amounts, seller, HALF_P);
+        market.openMarket{value: HALF_P}(1, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
     }
 
     function test_OpenMarketRevertsOnMismatchedContributions() public {
@@ -219,7 +229,7 @@ contract SpectralMarketTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(SpectralMarket.MismatchedInitialContributions.selector, 0.4 ether, HALF_P)
         );
-        market.openMarket{value: 0.9 ether}(1, B, funders, amounts, seller, HALF_P);
+        market.openMarket{value: 0.9 ether}(1, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
     }
 
     function test_OpenMarketRevertsOnIncorrectValueSent() public {
@@ -229,7 +239,7 @@ contract SpectralMarketTest is Test {
         amounts[0] = HALF_P;
         vm.prank(controller);
         vm.expectRevert(abi.encodeWithSelector(SpectralMarket.IncorrectValueSent.selector, P + 1, P));
-        market.openMarket{value: P + 1}(1, B, funders, amounts, seller, HALF_P);
+        market.openMarket{value: P + 1}(1, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
     }
 
     function test_OpenMarketRevertsForNonController() public {
@@ -239,7 +249,7 @@ contract SpectralMarketTest is Test {
         amounts[0] = HALF_P;
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(SpectralMarket.NotController.selector, stranger));
-        market.openMarket{value: P}(1, B, funders, amounts, seller, HALF_P);
+        market.openMarket{value: P}(1, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
     }
 
     // ── buy ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -475,7 +485,7 @@ contract SpectralMarketTest is Test {
         uint256[] memory amounts = new uint256[](1);
         amounts[0] = HALF_P;
         vm.prank(controller);
-        market.openMarket{value: P}(2, B, funders, amounts, seller, HALF_P);
+        market.openMarket{value: P}(2, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
         vm.prank(controller);
         market.resolveMarket(2, SpectralMarket.Side.Guilty);
 
@@ -495,7 +505,7 @@ contract SpectralMarketTest is Test {
         uint256[] memory amounts = new uint256[](1);
         amounts[0] = HALF_P;
         vm.prank(controller);
-        market.openMarket{value: P}(2, B, funders, amounts, seller, HALF_P);
+        market.openMarket{value: P}(2, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
         vm.prank(controller);
         market.resolveMarket(2, SpectralMarket.Side.Guilty);
 
@@ -569,7 +579,7 @@ contract SpectralMarketTest is Test {
 
         vm.deal(controller, halfP * 2 + 1);
         vm.prank(controller);
-        market.openMarket{value: halfP * 2}(1, b, funders, amounts, seller, halfP);
+        market.openMarket{value: halfP * 2}(1, b, funders, amounts, _singleton(seller), _singletonAmt(halfP));
 
         (uint256 pGuilty, uint256 pInnocent) = market.currentPrice(1);
         assertEq(pGuilty, 0.5e18);
@@ -609,5 +619,209 @@ contract SpectralMarketTest is Test {
         uint256 cost = market.buy{value: expectedCost + 1 ether}(1, SpectralMarket.Side.Guilty, shares);
 
         assertEq(cost, expectedCost);
+    }
+}
+
+/// @dev A DeveloperPool stand-in whose `receive()` always reverts, to test that a broken developer pool cannot
+///      corrupt {sweepSurplus}'s own state (the sweep must roll back entirely alongside the failed transfer).
+contract RevertingDeveloperPool {
+    receive() external payable {
+        revert("RevertingDeveloperPool: refuses ETH");
+    }
+}
+
+contract SpectralMarketSurplusTest is Test {
+    SpectralMarket internal market;
+    address internal controller = makeAddr("surplusController");
+    address internal seller = makeAddr("surplusSeller");
+    address internal guilty1 = makeAddr("surplusGuilty1");
+    address internal loser = makeAddr("surplusLoser");
+    address internal developerPool = makeAddr("developerPool");
+
+    uint256 internal constant P = 1 ether;
+    uint256 internal constant B = 1 ether;
+    uint256 internal constant HALF_P = 0.5 ether;
+
+    function setUp() public {
+        address[] memory controllers = new address[](1);
+        controllers[0] = controller;
+        market = new SpectralMarket(controllers, ISettlementConditionsHook(address(0)), developerPool);
+
+        vm.deal(controller, 1000 ether);
+        vm.deal(loser, 1000 ether);
+
+        address[] memory funders = new address[](1);
+        funders[0] = guilty1;
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = HALF_P;
+        address[] memory innocentRecipients = new address[](1);
+        innocentRecipients[0] = seller;
+        uint256[] memory innocentAmounts = new uint256[](1);
+        innocentAmounts[0] = HALF_P;
+
+        vm.prank(controller);
+        market.openMarket{value: P}(1, B, funders, amounts, innocentRecipients, innocentAmounts);
+    }
+
+    /// @notice The entire cost of a losing-side trade becomes surplus once resolved: it adds to `pooled` but the
+    ///         winning-side obligation (qGuilty here) never grows because of it.
+    function test_SweepSurplusTransfersLosingTradeCostAsSurplus() public {
+        vm.prank(loser);
+        uint256 cost = market.buy{value: 1 ether}(1, SpectralMarket.Side.Innocent, 0.3 ether);
+
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        uint256 devBefore = developerPool.balance;
+        uint256 surplus = market.sweepSurplus(1);
+
+        assertEq(surplus, cost, "the entire failed Innocent-side bet's cost becomes surplus when Guilty wins");
+        assertEq(developerPool.balance - devBefore, surplus);
+
+        vm.prank(guilty1);
+        uint256 payout = market.redeem(1);
+        assertEq(payout, 1 ether, "the winning side's redemption is unaffected by the surplus sweep");
+    }
+
+    function test_SweepSurplusEmitsEvent() public {
+        vm.prank(loser);
+        uint256 cost = market.buy{value: 1 ether}(1, SpectralMarket.Side.Innocent, 0.3 ether);
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        vm.expectEmit(true, true, true, true, address(market));
+        emit SpectralMarket.SurplusSwept(1, cost);
+        market.sweepSurplus(1);
+    }
+
+    function test_SweepSurplusIsPermissionless() public {
+        vm.prank(loser);
+        market.buy{value: 1 ether}(1, SpectralMarket.Side.Innocent, 0.3 ether);
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        vm.prank(makeAddr("anyRandomCaller"));
+        market.sweepSurplus(1); // must not revert - no access control on this function
+    }
+
+    function test_SweepSurplusRevertsWhenDeveloperPoolNotSet() public {
+        address[] memory controllers = new address[](1);
+        controllers[0] = controller;
+        SpectralMarket marketWithoutDevPool =
+            new SpectralMarket(controllers, ISettlementConditionsHook(address(0)), address(0));
+
+        address[] memory funders = new address[](1);
+        funders[0] = guilty1;
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = HALF_P;
+        address[] memory innocentRecipients = new address[](1);
+        innocentRecipients[0] = seller;
+        uint256[] memory innocentAmounts = new uint256[](1);
+        innocentAmounts[0] = HALF_P;
+        vm.prank(controller);
+        marketWithoutDevPool.openMarket{value: P}(1, B, funders, amounts, innocentRecipients, innocentAmounts);
+        vm.prank(controller);
+        marketWithoutDevPool.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        vm.expectRevert(SpectralMarket.DeveloperPoolNotSet.selector);
+        marketWithoutDevPool.sweepSurplus(1);
+    }
+
+    function test_SweepSurplusRevertsWhenMarketNotResolved() public {
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.MarketNotResolved.selector, 1));
+        market.sweepSurplus(1);
+    }
+
+    function test_SweepSurplusRevertsWhenNoSurplusExists() public {
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.NoSurplusToSweep.selector, 1));
+        market.sweepSurplus(1);
+    }
+
+    /// @notice Calling sweepSurplus again after it already collected everything must find nothing left - not
+    ///         double-sweep the winning side's own redemption backing.
+    function test_SweepSurplusIsNotDoubleCountedOnRepeatedCalls() public {
+        vm.prank(loser);
+        market.buy{value: 1 ether}(1, SpectralMarket.Side.Innocent, 0.3 ether);
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        market.sweepSurplus(1);
+
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.NoSurplusToSweep.selector, 1));
+        market.sweepSurplus(1);
+    }
+
+    /// @notice The surplus is a constant quantity from resolution onward regardless of how many winners have
+    ///         already redeemed - sweeping after a partial redemption must find the identical surplus, and the
+    ///         remaining winner must still redeem in full afterward. Uses two Guilty funders credited at
+    ///         *open* time (not a post-open buy) so both positions are exactly $1-per-share-backed from the
+    ///         start, isolating this from Section 2.6.9's separate "a winning trade's own cost is below its
+    ///         eventual payout" property (tested elsewhere).
+    function test_SweepSurplusUnaffectedByPriorPartialRedemption() public {
+        address[] memory funders = new address[](2);
+        funders[0] = guilty1;
+        funders[1] = makeAddr("surplusGuilty2");
+        uint256[] memory amounts = new uint256[](2);
+        amounts[0] = 0.3 ether;
+        amounts[1] = 0.2 ether;
+        address[] memory innocentRecipients = new address[](1);
+        innocentRecipients[0] = seller;
+        uint256[] memory innocentAmounts = new uint256[](1);
+        innocentAmounts[0] = HALF_P;
+
+        vm.prank(controller);
+        market.openMarket{value: P}(2, B, funders, amounts, innocentRecipients, innocentAmounts);
+
+        vm.prank(loser);
+        uint256 losingCost = market.buy{value: 1 ether}(2, SpectralMarket.Side.Innocent, 0.3 ether);
+
+        vm.prank(controller);
+        market.resolveMarket(2, SpectralMarket.Side.Guilty);
+
+        address guilty2 = funders[1];
+        vm.prank(guilty2);
+        uint256 guilty2Payout = market.redeem(2);
+        assertEq(guilty2Payout, 0.4 ether, "2x guilty2's own 0.2 ether contribution, per the unbiased-opening identity");
+
+        uint256 surplus = market.sweepSurplus(2);
+        assertEq(
+            surplus,
+            losingCost,
+            "surplus must equal exactly the losing trade's cost, unaffected by the prior redemption"
+        );
+
+        vm.prank(guilty1);
+        uint256 guilty1Payout = market.redeem(2);
+        assertEq(guilty1Payout, 0.6 ether, "the remaining winner must still redeem in full after the sweep");
+    }
+
+    function test_SweepSurplusRevertsWhenTransferFails() public {
+        RevertingDeveloperPool badPool = new RevertingDeveloperPool();
+        address[] memory controllers = new address[](1);
+        controllers[0] = controller;
+        SpectralMarket marketWithBadPool =
+            new SpectralMarket(controllers, ISettlementConditionsHook(address(0)), address(badPool));
+
+        address[] memory funders = new address[](1);
+        funders[0] = guilty1;
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = HALF_P;
+        address[] memory innocentRecipients = new address[](1);
+        innocentRecipients[0] = seller;
+        uint256[] memory innocentAmounts = new uint256[](1);
+        innocentAmounts[0] = HALF_P;
+        vm.prank(controller);
+        marketWithBadPool.openMarket{value: P}(1, B, funders, amounts, innocentRecipients, innocentAmounts);
+
+        vm.prank(loser);
+        uint256 cost = marketWithBadPool.buy{value: 1 ether}(1, SpectralMarket.Side.Innocent, 0.3 ether);
+        vm.prank(controller);
+        marketWithBadPool.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.TransferFailed.selector, address(badPool), cost));
+        marketWithBadPool.sweepSurplus(1);
     }
 }

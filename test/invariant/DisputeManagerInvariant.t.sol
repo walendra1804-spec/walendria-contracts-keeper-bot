@@ -6,6 +6,7 @@ import {IntegrityBond} from "../../src/IntegrityBond.sol";
 import {ListingManager} from "../../src/ListingManager.sol";
 import {SpectralMarket} from "../../src/SpectralMarket.sol";
 import {ISettlementConditionsHook} from "../../src/ISettlementConditionsHook.sol";
+import {DeveloperPool} from "../../src/DeveloperPool.sol";
 import {DisputeManager} from "../../src/DisputeManager.sol";
 import {DisputeManagerHandler} from "../handlers/DisputeManagerHandler.sol";
 
@@ -41,10 +42,10 @@ contract DisputeManagerInvariantTest is Test {
         address[] memory marketControllers = new address[](2);
         marketControllers[0] = priceController;
         marketControllers[1] = predictedDm;
-        market = new SpectralMarket(marketControllers, ISettlementConditionsHook(address(0)));
+        market = new SpectralMarket(marketControllers, ISettlementConditionsHook(address(0)), address(0));
         require(address(market) == predictedMarket, "CREATE nonce prediction drifted (market)");
 
-        dm = new DisputeManager(lm, bond, market);
+        dm = new DisputeManager(lm, bond, market, DeveloperPool(payable(address(0))));
         require(address(dm) == predictedDm, "CREATE nonce prediction drifted (dm)");
 
         for (uint256 i = 0; i < 3; i++) {

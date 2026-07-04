@@ -6,6 +6,7 @@ import {SD59x18} from "prb-math/SD59x18.sol";
 import {ListingManager} from "./ListingManager.sol";
 import {IntegrityBond} from "./IntegrityBond.sol";
 import {SpectralMarket} from "./SpectralMarket.sol";
+import {DeveloperPool} from "./DeveloperPool.sol";
 
 /// @title DisputeManager
 /// @notice Wires Settlement, IntegrityBond, and SpectralMarket together for Walendria Protocol "The 27" (Section
@@ -39,6 +40,12 @@ contract DisputeManager is ReentrancyGuard {
     ///      crosses the threshold.
     uint256 public constant MAX_GUILTY_FUNDERS = 200;
 
+    /// @notice Protocol Liquidity Buffer floor (Section 2.6.7, locked parameter): $5.00 total initial market
+    ///         depth, hardcoded as 5e18 wei on the assumption of a USD-pegged native currency - true for this
+    ///         deployment's target, Gnosis Chain, whose native gas token (xDAI) is a USD stablecoin, so no price
+    ///         oracle is needed to compare a wei amount against a dollar floor.
+    uint256 public constant MIN_LIQUIDITY_DEPTH = 5e18;
+
     struct GuiltyFunding {
         uint256 total;
         address[] funders;
@@ -54,6 +61,10 @@ contract DisputeManager is ReentrancyGuard {
     ListingManager public immutable listingManager;
     IntegrityBond public immutable integrityBond;
     SpectralMarket public immutable spectralMarket;
+    /// @notice Funds the Section 2.6.7 liquidity buffer top-up. Address(0) is a valid, deliberate choice
+    ///         disabling the top-up entirely - same rationale as SpectralMarket's settlementConditions/
+    ///         developerPool address(0) states.
+    DeveloperPool public immutable developerPool;
 
     mapping(uint256 marketId => GuiltyFunding) internal _guiltyFunding;
     mapping(uint256 marketId => Dispute) public disputes;
@@ -70,6 +81,7 @@ contract DisputeManager is ReentrancyGuard {
     );
     event MutualCloseProposed(uint256 indexed marketId, address indexed proposer, SpectralMarket.Side verdict);
     event DisputeFinalized(uint256 indexed marketId, SpectralMarket.Side winningSide, uint256 remainingLocked);
+    event LiquidityBufferToppedUp(uint256 indexed marketId, uint256 perSideAmount);
 
     error ZeroAmount();
     error ListingNotFound(uint256 listingId);
@@ -86,10 +98,16 @@ contract DisputeManager is ReentrancyGuard {
     error NotPartyToDispute(address caller, address buyer, address seller);
     error ThirdPartyParticipation(uint256 marketId, SpectralMarket.Side side);
 
-    constructor(ListingManager _listingManager, IntegrityBond _integrityBond, SpectralMarket _spectralMarket) {
+    constructor(
+        ListingManager _listingManager,
+        IntegrityBond _integrityBond,
+        SpectralMarket _spectralMarket,
+        DeveloperPool _developerPool
+    ) {
         listingManager = _listingManager;
         integrityBond = _integrityBond;
         spectralMarket = _spectralMarket;
+        developerPool = _developerPool;
     }
 
     /// @notice Accepts native currency as a purchase of "Seller Guilty" shares against the transaction at
@@ -233,9 +251,10 @@ contract DisputeManager is ReentrancyGuard {
 
     /// @dev Runs once, the instant cumulative Guilty-side funding reaches exactly `halfPrice` (Section 2.4). Draws
     ///      the matching `halfPrice` from the seller's Locked IB via slash-then-claim (IntegrityBond's existing
-    ///      pull-payment ledger, pulled immediately since this contract is itself the recipient), then performs
-    ///      the joint injection and freezes the slot, in that order - matching the whitepaper's framing that the
-    ///      IB draw and the market opening are one atomic state transition (Section 2.6.1), never two.
+    ///      pull-payment ledger, pulled immediately since this contract is itself the recipient), tops up the
+    ///      Section 2.6.7 liquidity buffer if this dispute's initial depth would otherwise fall short, then
+    ///      performs the joint injection and freezes the slot, in that order - matching the whitepaper's framing
+    ///      that the IB draw and the market opening are one atomic state transition (Section 2.6.1), never two.
     function _openDispute(
         uint256 listingId,
         uint256 slotIndex,
@@ -246,11 +265,10 @@ contract DisputeManager is ReentrancyGuard {
     ) internal {
         disputes[marketId].opened = true;
 
-        GuiltyFunding storage gf = _guiltyFunding[marketId];
-        uint256[] memory amounts = new uint256[](gf.funders.length);
-        for (uint256 i = 0; i < gf.funders.length; i++) {
-            amounts[i] = gf.contributionOf[gf.funders[i]];
-        }
+        uint256 bufferPerSide = _pullLiquidityBufferIfNeeded(marketId, halfPrice);
+        (address[] memory guiltyFunders, uint256[] memory guiltyAmounts) = _buildGuiltyArrays(marketId, bufferPerSide);
+        (address[] memory innocentRecipients, uint256[] memory innocentAmounts) =
+            _buildInnocentArrays(seller, halfPrice, bufferPerSide);
 
         integrityBond.slash(seller, halfPrice, address(this));
         integrityBond.claim();
@@ -258,9 +276,75 @@ contract DisputeManager is ReentrancyGuard {
         listingManager.markDisputed(listingId, slotIndex);
 
         // b = 1 * P (Section 2.6.4's locked calibration, already documented at {SpectralMarket-openMarket}).
-        spectralMarket.openMarket{value: halfPrice * 2}(marketId, price, gf.funders, amounts, seller, halfPrice);
+        uint256 totalValue = (halfPrice + bufferPerSide) * 2;
+        spectralMarket.openMarket{value: totalValue}(
+            marketId, price, guiltyFunders, guiltyAmounts, innocentRecipients, innocentAmounts
+        );
 
         emit DisputeOpened(marketId, listingId, slotIndex, seller, halfPrice);
+    }
+
+    /// @dev Section 2.6.7: if this dispute's initial 1P-total depth (`halfPrice * 2`) would fall short of the
+    ///      $5-equivalent floor, pulls the shortfall's half from {developerPool} (capped at its available
+    ///      balance - see {DeveloperPool-pullLiquidityBuffer}'s graceful-degradation doc) so {_openDispute} can
+    ///      credit DeveloperPool.sol symmetrically on both sides in the same atomic joint injection. Returns 0 if
+    ///      no top-up is needed or {developerPool} is unset (see its own doc for why that is a valid state).
+    function _pullLiquidityBufferIfNeeded(uint256 marketId, uint256 halfPrice) internal returns (uint256 perSide) {
+        if (address(developerPool) == address(0)) return 0;
+        uint256 initialDepth = halfPrice * 2;
+        if (initialDepth >= MIN_LIQUIDITY_DEPTH) return 0;
+
+        uint256 desiredPerSide = (MIN_LIQUIDITY_DEPTH - initialDepth) / 2;
+        if (desiredPerSide == 0) return 0;
+
+        // Pulls *twice* the per-side amount: bufferPerSide is credited to DeveloperPool on both the Guilty and
+        // Innocent side (Section 2.6.7's "split exactly 50/50"), so this contract must actually hold 2x perSide,
+        // not just perSide, before forwarding it into {SpectralMarket-openMarket}.
+        uint256 received = developerPool.pullLiquidityBuffer(desiredPerSide * 2);
+        perSide = received / 2;
+        if (perSide > 0) emit LiquidityBufferToppedUp(marketId, perSide);
+    }
+
+    /// @dev Builds {SpectralMarket-openMarket}'s Guilty-side arrays: every recorded funder, plus DeveloperPool.sol
+    ///      as one more entry if a liquidity-buffer top-up applied. Split out of {_openDispute} to keep its own
+    ///      stack depth within Solidity's limit.
+    function _buildGuiltyArrays(uint256 marketId, uint256 bufferPerSide)
+        internal
+        view
+        returns (address[] memory funders, uint256[] memory amounts)
+    {
+        GuiltyFunding storage gf = _guiltyFunding[marketId];
+        uint256 baseCount = gf.funders.length;
+        uint256 count = bufferPerSide > 0 ? baseCount + 1 : baseCount;
+        funders = new address[](count);
+        amounts = new uint256[](count);
+        for (uint256 i = 0; i < baseCount; i++) {
+            funders[i] = gf.funders[i];
+            amounts[i] = gf.contributionOf[gf.funders[i]];
+        }
+        if (bufferPerSide > 0) {
+            funders[baseCount] = address(developerPool);
+            amounts[baseCount] = bufferPerSide;
+        }
+    }
+
+    /// @dev Mirrors {_buildGuiltyArrays} for the Innocent side: the seller, plus DeveloperPool.sol if a top-up
+    ///      applied - the "split exactly 50/50" of Section 2.6.7 realized as an identical `bufferPerSide` credited
+    ///      on both sides of the same joint injection.
+    function _buildInnocentArrays(address seller, uint256 halfPrice, uint256 bufferPerSide)
+        internal
+        view
+        returns (address[] memory recipients, uint256[] memory amounts)
+    {
+        uint256 count = bufferPerSide > 0 ? 2 : 1;
+        recipients = new address[](count);
+        amounts = new uint256[](count);
+        recipients[0] = seller;
+        amounts[0] = halfPrice;
+        if (bufferPerSide > 0) {
+            recipients[1] = address(developerPool);
+            amounts[1] = bufferPerSide;
+        }
     }
 
     /// @dev The no-third-party-holder invariant (Section 2.6.10, "the entire safety property of the function" per
