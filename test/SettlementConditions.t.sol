@@ -103,39 +103,77 @@ contract SettlementConditionsTest is Test {
         assertFalse(resolved, "market must remain untouched by the rejected fake checkpoint");
     }
 
-    // ── Condition A: instant threshold ─────────────────────────────────────────────────────────────────────────
+    // ── No instant resolution at any price ─────────────────────────────────────────────────────────────────────
+    // A prior revision resolved a case the instant either side's price touched 90% in a single transaction. This
+    // let one sufficiently capitalized trade force an irreversible resolution with zero reaction time for anyone
+    // else, no matter how transient the crossing was - the exact one-shot manipulation this revision closes.
+    // There is no longer any price, however high, that resolves a case by itself; only accumulated time above
+    // CUMULATIVE_THRESHOLD (tracked below) can.
 
-    function test_ConditionA_GuiltyCrossing90PercentResolvesInstantly() public {
-        uint256 sharesToReach92 = _sharesToReachPrice(B, 0.92e18);
+    function test_GuiltyCrossing95PercentDoesNotResolveInstantly() public {
+        uint256 sharesToReach95 = _sharesToReachPrice(B, 0.95e18);
 
         vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach92);
+        market.buy{value: 20 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach95);
 
-        assertEq(market.sharesOf(MARKET_ID, SpectralMarket.Side.Guilty, buyer), sharesToReach92, "trade still applied");
+        assertEq(market.sharesOf(MARKET_ID, SpectralMarket.Side.Guilty, buyer), sharesToReach95, "trade still applied");
 
-        (bool resolved, SpectralMarket.Side winningSide) = _isResolved(MARKET_ID);
-        assertTrue(resolved);
+        (bool resolved,) = _isResolved(MARKET_ID);
+        assertFalse(resolved, "no price, however high, resolves a case in the same transaction it is reached");
+    }
+
+    function test_InnocentCrossing95PercentDoesNotResolveInstantly() public {
+        uint256 sharesToReach95 = _sharesToReachPrice(B, 0.95e18);
+
+        vm.prank(buyer);
+        market.buy{value: 20 ether}(MARKET_ID, SpectralMarket.Side.Innocent, sharesToReach95);
+
+        (bool resolved,) = _isResolved(MARKET_ID);
+        assertFalse(resolved);
+    }
+
+    /// @notice Direct regression test for the explicit design requirement: even a single trade that pushes price
+    ///         to 99% or effectively 100% must still wait out the full cumulative window - there is no price high
+    ///         enough to force an instant resolution.
+    function test_Crossing99PercentStillDoesNotResolveInstantly() public {
+        uint256 sharesToReach99 = _sharesToReachPrice(B, 0.99e18);
+
+        vm.prank(buyer);
+        market.buy{value: 50 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach99);
+
+        (uint256 pGuilty,) = market.currentPrice(MARKET_ID);
+        // >= 0.98e18 rather than the nominal 0.99e18 target: PRBMath's ln/exp fixed-point rounding can land a
+        // handful of wei under the exact target, which is irrelevant to what this test actually checks (a price
+        // very close to 100% still does not resolve instantly).
+        assertGe(pGuilty, 0.98e18, "trade must have genuinely reached ~99% for this test to be meaningful");
+
+        (bool resolved,) = _isResolved(MARKET_ID);
+        assertFalse(resolved, "99% must not resolve instantly - only the cumulative timer may resolve a case");
+    }
+
+    /// @notice The other half of the same guarantee: crossing 99% in one shot still only starts the same
+    ///         cumulative clock every smaller crossing does - it resolves after 1 hour, not before and not
+    ///         instantly.
+    function test_Crossing99PercentEventuallyResolvesOnlyAfterCumulativeOneHour() public {
+        uint256 sharesToReach99 = _sharesToReachPrice(B, 0.99e18);
+        vm.prank(buyer);
+        market.buy{value: 50 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach99);
+
+        vm.warp(block.timestamp + 59 minutes);
+        vm.prank(buyer);
+        market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9);
+        (bool resolvedEarly,) = _isResolved(MARKET_ID);
+        assertFalse(resolvedEarly, "still short of the 1-hour cumulative requirement");
+
+        vm.warp(block.timestamp + 2 minutes);
+        vm.prank(buyer);
+        market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9);
+        (bool resolvedAfter, SpectralMarket.Side winningSide) = _isResolved(MARKET_ID);
+        assertTrue(resolvedAfter, "1 hour cumulative above 93% must resolve, exactly as any smaller crossing would");
         assertEq(uint256(winningSide), uint256(SpectralMarket.Side.Guilty));
-
-        vm.prank(buyer);
-        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.MarketAlreadyResolved.selector, MARKET_ID));
-        market.buy{value: 1 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e15);
     }
 
-    function test_ConditionA_InnocentCrossing90PercentResolvesInstantly() public {
-        // Sell down the seller's own Innocent-side price by buying enough Guilty first would flip Guilty, not
-        // Innocent - instead buy Innocent directly to push its own price up.
-        uint256 sharesToReach92 = _sharesToReachPrice(B, 0.92e18);
-
-        vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Innocent, sharesToReach92);
-
-        (bool resolved, SpectralMarket.Side winningSide) = _isResolved(MARKET_ID);
-        assertTrue(resolved);
-        assertEq(uint256(winningSide), uint256(SpectralMarket.Side.Innocent));
-    }
-
-    function test_ConditionA_DoesNotResolveWhenPriceStaysBelow90Percent() public {
+    function test_PriceBelow93PercentNeverResolves() public {
         uint256 sharesToReach70 = _sharesToReachPrice(B, 0.7e18);
 
         vm.prank(buyer);
@@ -145,17 +183,17 @@ contract SettlementConditionsTest is Test {
         assertFalse(resolved);
     }
 
-    // ── Condition B: cumulative stability ──────────────────────────────────────────────────────────────────────
+    // ── Cumulative stability (the sole resolution condition) ───────────────────────────────────────────────────
 
-    function test_ConditionB_ResolvesAfterCumulativeThreeHoursAbove87Percent() public {
-        uint256 sharesToReach88 = _sharesToReachPrice(B, 0.88e18);
+    function test_ResolvesAfterCumulativeOneHourAbove93Percent() public {
+        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
         vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach88);
+        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
 
         (bool resolvedBefore,) = _isResolved(MARKET_ID);
-        assertFalse(resolvedBefore, "88% alone should not trigger Condition A, and no cumulative time has passed yet");
+        assertFalse(resolvedBefore, "94% alone must not resolve instantly, and no cumulative time has passed yet");
 
-        vm.warp(block.timestamp + 3 hours + 1);
+        vm.warp(block.timestamp + 1 hours + 1);
         vm.prank(buyer);
         market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9); // tiny trade just to checkpoint
 
@@ -164,12 +202,12 @@ contract SettlementConditionsTest is Test {
         assertEq(uint256(winningSide), uint256(SpectralMarket.Side.Guilty));
     }
 
-    function test_ConditionB_DoesNotResolveBeforeThreeHoursElapsed() public {
-        uint256 sharesToReach88 = _sharesToReachPrice(B, 0.88e18);
+    function test_DoesNotResolveBeforeOneHourElapsed() public {
+        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
         vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach88);
+        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
 
-        vm.warp(block.timestamp + 2 hours + 59 minutes);
+        vm.warp(block.timestamp + 59 minutes);
         vm.prank(buyer);
         market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9);
 
@@ -177,55 +215,56 @@ contract SettlementConditionsTest is Test {
         assertFalse(resolved);
     }
 
-    /// @notice "The timer pauses below 87% - it does not reset" (Section 2.6.5). Accumulates 2h above 87%, dips
-    ///         below for 2h (must not count), then resumes above 87% for just over 1h - total counted time
-    ///         crosses 3h (2h + 1h+1s), even though only ~3h+1s of real time elapsed *above* the threshold out of
-    ///         ~5h+1s total elapsed. A naive reset-on-dip implementation would never reach 3h counted this way.
-    function test_ConditionB_PausesRatherThanResetsOnADipBelowThreshold() public {
-        uint256 sharesToReach88 = _sharesToReachPrice(B, 0.88e18);
+    /// @notice "The timer pauses below 93% - it does not reset" (Section 2.6.5). Accumulates 40 minutes above
+    ///         93%, dips below for 30 minutes (must not count), then resumes above 93% for just over 20 minutes -
+    ///         total counted time crosses 1 hour (40min + 20min+1s), even though additional real time elapsed
+    ///         below the threshold in between. A naive reset-on-dip implementation would never reach 1 hour
+    ///         counted this way.
+    function test_PausesRatherThanResetsOnADipBelowThreshold() public {
+        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
         vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach88);
+        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
 
-        vm.warp(block.timestamp + 2 hours);
+        vm.warp(block.timestamp + 40 minutes);
         vm.prank(buyer);
-        market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9); // checkpoint: +2h to cumulative
+        market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9); // checkpoint: +40min to cumulative
 
-        // Dip: sell back down to well below 87% (e.g. 50%) by selling most of the Guilty position bought above.
+        // Dip: sell back down to well below 93% (e.g. 50%) by selling most of the Guilty position bought above.
         uint256 heldByBuyer = market.sharesOf(MARKET_ID, SpectralMarket.Side.Guilty, buyer);
         vm.prank(buyer);
         market.sell(MARKET_ID, SpectralMarket.Side.Guilty, heldByBuyer - 1e9, 0);
         (uint256 pGuiltyAfterDip,) = market.currentPrice(MARKET_ID);
-        assertLt(pGuiltyAfterDip, 0.87e18, "must genuinely dip below 87% for this test to be meaningful");
+        assertLt(pGuiltyAfterDip, 0.93e18, "must genuinely dip below 93% for this test to be meaningful");
 
-        vm.warp(block.timestamp + 2 hours); // 2h while BELOW 87% - must not count
+        vm.warp(block.timestamp + 30 minutes); // 30min while BELOW 93% - must not count
         vm.prank(buyer);
         market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9); // checkpoint: dip credited 0
 
         (uint256 cumulativeGuiltyMid,,,,,) = conditions.tracking(MARKET_ID);
-        assertEq(cumulativeGuiltyMid, 2 hours, "the 2h spent below 87% must not have been credited");
+        assertEq(cumulativeGuiltyMid, 40 minutes, "the 30min spent below 93% must not have been credited");
 
-        // Resume: buy back above 87%.
-        uint256 sharesToReach88Again = _sharesToReachPrice(B, 0.88e18);
+        // Resume: buy back above 93%.
+        uint256 sharesToReach94Again = _sharesToReachPrice(B, 0.94e18);
         vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach88Again);
+        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94Again);
 
-        vm.warp(block.timestamp + 1 hours + 1);
+        vm.warp(block.timestamp + 20 minutes + 1);
         vm.prank(buyer);
-        market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9); // checkpoint: +1h+1s -> crosses 3h
+        market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9); // checkpoint: +20min+1s -> crosses 1h
 
         (bool resolved, SpectralMarket.Side winningSide) = _isResolved(MARKET_ID);
-        assertTrue(resolved, "2h + 1h+1s of real (non-contiguous) time above 87% must still cross the 3h threshold");
+        assertTrue(resolved, "40min + 20min+1s of real (non-contiguous) time above 93% must still cross 1 hour");
         assertEq(uint256(winningSide), uint256(SpectralMarket.Side.Guilty));
     }
 
     // ── pokeSettlement ─────────────────────────────────────────────────────────────────────────────────────────
 
     function test_PokeSettlementResolvesWithZeroFurtherTradesAfterThresholdCrossing() public {
-        uint256 sharesToReach88 = _sharesToReachPrice(B, 0.88e18);
+        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
         vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach88);
+        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
 
-        vm.warp(block.timestamp + 3 hours + 1);
+        vm.warp(block.timestamp + 1 hours + 1);
 
         address stranger = makeAddr("pokeStranger");
         vm.prank(stranger);
@@ -247,9 +286,11 @@ contract SettlementConditionsTest is Test {
     }
 
     function test_PokeSettlementRevertsForAlreadyResolvedMarket() public {
-        uint256 sharesToReach92 = _sharesToReachPrice(B, 0.92e18);
+        uint256 sharesToReach95 = _sharesToReachPrice(B, 0.95e18);
         vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach92); // auto-resolves via A
+        market.buy{value: 20 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach95);
+        vm.warp(block.timestamp + 1 hours + 1);
+        conditions.pokeSettlement(MARKET_ID); // resolves it
 
         vm.expectRevert(abi.encodeWithSelector(SettlementConditions.MarketAlreadyResolved.selector, MARKET_ID));
         conditions.pokeSettlement(MARKET_ID);
@@ -258,10 +299,10 @@ contract SettlementConditionsTest is Test {
     function test_PokeSettlementPaysFullBountyToCaller() public {
         conditions.fundBounty{value: 1 ether}();
 
-        uint256 sharesToReach88 = _sharesToReachPrice(B, 0.88e18);
+        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
         vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach88);
-        vm.warp(block.timestamp + 3 hours + 1);
+        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
+        vm.warp(block.timestamp + 1 hours + 1);
 
         address poker = makeAddr("poker");
         uint256 before = poker.balance;
@@ -275,10 +316,10 @@ contract SettlementConditionsTest is Test {
     function test_PokeSettlementPaysPartialBountyWithoutBlockingResolution() public {
         conditions.fundBounty{value: POKE_BOUNTY / 2}();
 
-        uint256 sharesToReach88 = _sharesToReachPrice(B, 0.88e18);
+        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
         vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach88);
-        vm.warp(block.timestamp + 3 hours + 1);
+        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
+        vm.warp(block.timestamp + 1 hours + 1);
 
         address poker = makeAddr("poker2");
         uint256 before = poker.balance;
@@ -292,10 +333,10 @@ contract SettlementConditionsTest is Test {
     }
 
     function test_PokeSettlementResolvesWithZeroBountyWhenPoolEmpty() public {
-        uint256 sharesToReach88 = _sharesToReachPrice(B, 0.88e18);
+        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
         vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach88);
-        vm.warp(block.timestamp + 3 hours + 1);
+        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
+        vm.warp(block.timestamp + 1 hours + 1);
 
         conditions.pokeSettlement(MARKET_ID); // bountyPool is 0 (never funded) - must still succeed
 
@@ -328,12 +369,12 @@ contract SettlementConditionsTest is Test {
         vm.prank(controller);
         market.openMarket{value: P}(2, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
 
-        uint256 sharesToReach88 = _sharesToReachPrice(B, 0.88e18);
+        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
         vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach88);
-        vm.warp(block.timestamp + 3 hours + 1);
+        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
+        vm.warp(block.timestamp + 1 hours + 1);
         vm.prank(buyer);
-        market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9); // resolves market 1 via B
+        market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9); // resolves market 1
 
         (bool resolved1,) = _isResolved(MARKET_ID);
         (bool resolved2,) = _isResolved(2);

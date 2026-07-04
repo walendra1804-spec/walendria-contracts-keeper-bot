@@ -10,7 +10,7 @@ interface ISettlementConditionsHook {
     /// @param marketId The market that was just traded.
     /// @param priceGuilty Current (post-trade) marginal Guilty price, SD59x18-scaled (1e18 = 100%).
     /// @param priceInnocent Current (post-trade) marginal Innocent price, SD59x18-scaled.
-    /// @return shouldResolve True if Condition A or Condition B (Section 2.6.5) has just been met.
+    /// @return shouldResolve True if the cumulative-time resolution condition (Section 2.6.5) has just been met.
     /// @return guiltyWins Meaningful only when `shouldResolve` is true.
     function checkpoint(uint256 marketId, uint256 priceGuilty, uint256 priceInnocent)
         external

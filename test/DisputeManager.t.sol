@@ -394,10 +394,12 @@ contract DisputeManagerTest is Test {
     // ── fundGuiltySide: adversarial ────────────────────────────────────────────────────────────────────────────
 
     /// @notice Direct regression test named in the build strategy: a seller funded with *only* the 0.995P sale
-    ///         proceeds cannot force resolution at 87%/90% - the concrete regression for the finding that drove
-    ///         the threshold change from 70%/75%. Simulates having received sale proceeds via vm.deal rather than
-    ///         a real Settlement.pay() call, since Settlement's own correctness is already covered in Phase 4.
-    function test_SellerDefendingWithOnlySaleProceedsCannotReachNinetyPercent() public {
+    ///         proceeds cannot force resolution at the 93% resolution threshold - the concrete regression for the
+    ///         finding that originally drove the threshold change from 70%/75%, still true after the later
+    ///         unification onto a single 93%/1-hour cumulative condition (no more separate instant threshold).
+    ///         Simulates having received sale proceeds via vm.deal rather than a real Settlement.pay() call, since
+    ///         Settlement's own correctness is already covered in Phase 4.
+    function test_SellerDefendingWithOnlySaleProceedsCannotReachNinetyThreePercent() public {
         uint256 listingId = _openConfirmedListing();
         uint256 marketId = _marketId(listingId, 0);
 
@@ -412,8 +414,8 @@ contract DisputeManagerTest is Test {
         market.buy{value: saleProceeds}(marketId, SpectralMarket.Side.Innocent, affordableShares);
 
         (uint256 pGuilty, uint256 pInnocent) = market.currentPrice(marketId);
-        assertLt(pInnocent, 0.9e18, "0.995P alone must not be enough to reach the 90% instant threshold");
-        assertGt(pGuilty, 0.1e18);
+        assertLt(pInnocent, 0.93e18, "0.995P alone must not be enough to reach the 93% resolution threshold");
+        assertGt(pGuilty, 0.07e18);
     }
 
     function test_ReentrantFunderCannotReenterFundGuiltySideDuringRefund() public {

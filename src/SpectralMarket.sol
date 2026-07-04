@@ -355,9 +355,10 @@ contract SpectralMarket is ReentrancyGuard {
 
     /// @notice Runs the checkpoint-on-trade hook (Section 2.6.8 point 1) after {buy}/{sell} have already applied
     ///         their own state changes, using the now-current (post-trade) price - this is also what lets
-    ///         {ISettlementConditionsHook-checkpoint} implement Condition A (Section 2.6.5's instant 90%
-    ///         threshold) as "did the trade that just happened cross it", not a stale pre-trade snapshot. A no-op
-    ///         when {settlementConditions} is unset (see its own doc for why that is a deliberate, valid state).
+    ///         {ISettlementConditionsHook-checkpoint} see the trade's own resulting price immediately rather than
+    ///         a stale pre-trade snapshot, even though no single trade ever resolves a case by itself (Section
+    ///         2.6.5: only accumulated time above the resolution threshold can). A no-op when
+    ///         {settlementConditions} is unset (see its own doc for why that is a deliberate, valid state).
     function _checkpointAndMaybeResolve(uint256 marketId, Market storage m) internal {
         if (address(settlementConditions) == address(0)) return;
 

@@ -105,7 +105,7 @@ contract IntegrationTest is Test {
         assertEq(withdrawalRecipient.balance, (price * 5) / 1000);
     }
 
-    // ── Scenario: disputed transaction, resolves Guilty via Condition A (price threshold) ────────────────────
+    // ── Scenario: disputed transaction, resolves Guilty via the cumulative price threshold ──────────────────
 
     function test_DisputedTransactionResolvesGuiltyViaPriceThresholdAndBuyerClaimsRestitution() public {
         uint256 price = 10 ether;
@@ -117,21 +117,31 @@ contract IntegrationTest is Test {
         (,,,, bool open,,) = market.markets(marketId);
         assertTrue(open, "threshold crossing must atomically open the market");
 
-        // A separate trader (not buyer) pushes Guilty price past the 90% instant-resolution threshold (Condition
-        // A) - the checkpoint hook inside SpectralMarket.buy resolves it in the same transaction, no separate
-        // call needed. Deliberately not buyer themselves: a single actor's own winning trade costs less than its
-        // eventual $1/share payout (Section 2.6.9), and a large enough one can leave the pool under-collateralized
-        // for that same actor's redemption - a real, documented LMSR bounded-loss property, not a bug, but not
-        // what this scenario is testing. Keeping buyer's own redemption to just their original joint-injection
-        // share avoids exercising that corner case here.
+        // A separate trader (not buyer) pushes Guilty price past the 93% resolution threshold. This alone does
+        // NOT resolve the market instantly, however far past 93% it goes (Section 2.6.5) - it only starts the
+        // cumulative timer the checkpoint hook inside SpectralMarket.buy tracks. Deliberately not buyer
+        // themselves: a single actor's own winning trade costs less than its eventual $1/share payout (Section
+        // 2.6.9), and a large enough one can leave the pool under-collateralized for that same actor's redemption
+        // - a real, documented LMSR bounded-loss property, not a bug, but not what this scenario is testing.
+        // Keeping buyer's own redemption to just their original joint-injection share avoids exercising that
+        // corner case here.
         address otherTrader = makeAddr("otherTrader");
         vm.deal(otherTrader, 100 ether);
-        uint256 sharesToReach91 = _sharesToReachPrice(price, 0.91e18);
+        uint256 sharesToReach95 = _sharesToReachPrice(price, 0.95e18);
         vm.prank(otherTrader);
-        market.buy{value: 100 ether}(marketId, SpectralMarket.Side.Guilty, sharesToReach91);
+        market.buy{value: 100 ether}(marketId, SpectralMarket.Side.Guilty, sharesToReach95);
+
+        (,,,,, bool resolvedInstantly,) = market.markets(marketId);
+        assertFalse(resolvedInstantly, "no price, however high, resolves a case in the same transaction");
+
+        // The cumulative 1-hour window (Section 2.6.5) must elapse, then a fresh checkpoint (any trade, or a
+        // pokeSettlement call) observes it and resolves.
+        vm.warp(block.timestamp + 1 hours + 1);
+        vm.prank(otherTrader);
+        market.buy{value: 0.01 ether}(marketId, SpectralMarket.Side.Guilty, 1e9);
 
         (,,,,, bool resolved, SpectralMarket.Side winningSide) = market.markets(marketId);
-        assertTrue(resolved, "Condition A should have resolved the market automatically");
+        assertTrue(resolved, "the cumulative condition should have resolved the market");
         assertEq(uint8(winningSide), uint8(SpectralMarket.Side.Guilty));
 
         dm.finalizeDispute(listingId, 0);
@@ -161,11 +171,19 @@ contract IntegrationTest is Test {
         vm.prank(backer);
         dm.fundGuiltySide{value: price / 2}(listingId, 0);
 
-        // Seller defends, pushing Innocent price past 90% (whether sale proceeds alone are *sufficient* for this
-        // is a separate, already-covered adversarial property - see DisputeManager.t.sol's dedicated test).
-        uint256 sharesToReach91 = _sharesToReachPrice(price, 0.91e18);
+        // Seller defends, pushing Innocent price past 93% (whether sale proceeds alone are *sufficient* for this
+        // is a separate, already-covered adversarial property - see DisputeManager.t.sol's dedicated test). This
+        // alone does not resolve instantly (Section 2.6.5); the cumulative 1-hour window must elapse first.
+        uint256 sharesToReach95 = _sharesToReachPrice(price, 0.95e18);
         vm.prank(seller);
-        market.buy{value: 100 ether}(marketId, SpectralMarket.Side.Innocent, sharesToReach91);
+        market.buy{value: 100 ether}(marketId, SpectralMarket.Side.Innocent, sharesToReach95);
+
+        (,,,,, bool resolvedInstantly,) = market.markets(marketId);
+        assertFalse(resolvedInstantly, "no price, however high, resolves a case in the same transaction");
+
+        vm.warp(block.timestamp + 1 hours + 1);
+        vm.prank(seller);
+        market.buy{value: 0.01 ether}(marketId, SpectralMarket.Side.Innocent, 1e9);
 
         (,,,,, bool resolved, SpectralMarket.Side winningSide) = market.markets(marketId);
         assertTrue(resolved);
@@ -207,12 +225,12 @@ contract IntegrationTest is Test {
 
         vm.prank(buyer);
         dm.fundGuiltySide{value: price / 2}(listingId, 0);
-        uint256 sharesToReach88 = _sharesToReachPrice(price, 0.88e18); // crosses 87%, comfortably short of 90%
+        uint256 sharesToReach94 = _sharesToReachPrice(price, 0.94e18); // crosses 93%
         vm.prank(buyer);
-        market.buy{value: 100 ether}(marketId, SpectralMarket.Side.Guilty, sharesToReach88);
+        market.buy{value: 100 ether}(marketId, SpectralMarket.Side.Guilty, sharesToReach94);
 
         conditions.fundBounty{value: POKE_BOUNTY}();
-        vm.warp(block.timestamp + 3 hours + 1);
+        vm.warp(block.timestamp + 1 hours + 1);
 
         address poker = makeAddr("poker");
         uint256 pokerBefore = poker.balance;
@@ -220,7 +238,7 @@ contract IntegrationTest is Test {
         conditions.pokeSettlement(marketId);
 
         (,,,,, bool resolved,) = market.markets(marketId);
-        assertTrue(resolved, "Condition B's cumulative timer should resolve via the poke, with no further trades");
+        assertTrue(resolved, "the cumulative timer should resolve via the poke, with no further trades");
         assertEq(poker.balance - pokerBefore, POKE_BOUNTY, "poker earns the bounty for the successful call");
 
         dm.finalizeDispute(listingId, 0);
@@ -261,7 +279,7 @@ contract IntegrationTest is Test {
 
     // ── Scenario: resolution surplus sweeps to DeveloperPool ──────────────────────────────────────────────────
 
-    /// @dev Deliberately does not push price to the 87%/90% threshold via a winning-side trade: Section 2.6.9's
+    /// @dev Deliberately does not push price to the 93% threshold via a winning-side trade: Section 2.6.9's
     ///      own theorem means any trade reaching that far always costs less than its eventual payout, which
     ///      *reduces* net surplus, not adds to it - reaching the security threshold is supposed to be expensive,
     ///      by design. Genuine positive surplus instead comes from a losing-side trade with no matching

@@ -6,13 +6,17 @@ import {SpectralMarket} from "./SpectralMarket.sol";
 import {ISettlementConditionsHook} from "./ISettlementConditionsHook.sol";
 
 /// @title SettlementConditions
-/// @notice Condition A/B tracking and the checkpoint-and-poke mechanism for Walendria Protocol "The 27" (Section
+/// @notice The settlement condition and checkpoint-and-poke mechanism for Walendria Protocol "The 27" (Section
 ///         2.6.5, 2.6.8). One instance tracks every market opened on a single, fixed SpectralMarket.
 ///
-///         Condition A (instant): either side's price touching 90% resolves the case immediately.
-///         Condition B (cumulative): a stopwatch-style timer tracks total time either side's price has spent at
-///         or above 87% - it pauses (never resets) below 87%, and resolves the case once accumulated time
-///         reaches 3 hours (Section 1's locked parameter table).
+///         A cumulative (stopwatch-style) timer tracks total time either side's price has spent at or above 93% -
+///         it pauses (never resets) below 93%, and resolves the case once accumulated time reaches 1 hour
+///         (Section 1's locked parameter table). There is no instant-resolution path at any price: a single trade
+///         may move price arbitrarily far in one step - to 93%, to 99%, to anywhere below 100% - but it can never
+///         resolve a case by itself. This closes a one-shot manipulation path a prior revision's separate instant
+///         threshold left open: a single, sufficiently capitalized transaction that crossed that threshold
+///         resolved the case in the same transaction, leaving zero reaction time for any other participant to
+///         notice and counter-trade, regardless of how transient or narrow the crossing was.
 /// @dev Phase 6 of the build strategy. Depends on Phase 5 (SpectralMarket.sol), which now calls {checkpoint} on
 ///      every successful buy/sell (see SpectralMarket's `_checkpointAndMaybeResolve`). No oracle, off-chain
 ///      timer, or designated keeper is required (Section 2.6.8): elapsed time at a given price is exactly
@@ -33,20 +37,19 @@ contract SettlementConditions is ISettlementConditionsHook, ReentrancyGuard {
         uint256 cumulativeInnocent;
         uint256 lastCheckpointTime;
         bool trackedSideIsGuilty; // meaningful only if trackedSideActive
-        bool trackedSideActive; // true if either side was >=87% as of the last checkpoint
+        bool trackedSideActive; // true if either side was >=93% as of the last checkpoint
         bool initialized;
     }
 
-    /// @notice Condition A (Section 2.6.5): instant resolution the moment either side's price touches this.
-    uint256 public constant INSTANT_THRESHOLD = 0.9e18;
-    /// @notice Condition B (Section 2.6.5): the price level whose cumulative time above it is tracked.
-    uint256 public constant CUMULATIVE_THRESHOLD = 0.87e18;
-    /// @notice Condition B (Section 2.6.5, confirmed 2026-07-03): cumulative time above threshold to resolve.
-    uint256 public constant CUMULATIVE_DURATION = 3 hours;
+    /// @notice Section 2.6.5: the price level whose cumulative time above it is tracked. This is the only
+    ///         settlement condition - there is no separate instant-resolution threshold at any price.
+    uint256 public constant CUMULATIVE_THRESHOLD = 0.93e18;
+    /// @notice Section 2.6.5 (confirmed 2026-07-04): cumulative time above threshold required to resolve.
+    uint256 public constant CUMULATIVE_DURATION = 1 hours;
 
     SpectralMarket public immutable spectralMarket;
     /// @notice Fixed bounty paid to a successful {pokeSettlement} caller. Not a locked protocol parameter (the
-    ///         spec only says "a small, fixed bounty" without a number, unlike 90%/87%/3-hours), so this is a
+    ///         spec only says "a small, fixed bounty" without a number, unlike 93%/1 hour), so this is a
     ///         deployer-configurable immutable rather than a hardcoded constant.
     uint256 public immutable pokeBounty;
 
@@ -54,8 +57,7 @@ contract SettlementConditions is ISettlementConditionsHook, ReentrancyGuard {
     uint256 public bountyPool;
 
     event Checkpointed(uint256 indexed marketId, uint256 cumulativeGuilty, uint256 cumulativeInnocent);
-    event ConditionAMet(uint256 indexed marketId, bool guiltyWins, uint256 price);
-    event ConditionBMet(uint256 indexed marketId, bool guiltyWins, uint256 cumulativeTime);
+    event ResolutionMet(uint256 indexed marketId, bool guiltyWins, uint256 cumulativeTime);
     event Poked(uint256 indexed marketId, address indexed poker, uint256 bountyPaid);
     event BountyFunded(address indexed funder, uint256 amount);
 
@@ -94,7 +96,7 @@ contract SettlementConditions is ISettlementConditionsHook, ReentrancyGuard {
     /// @notice Permissionlessly re-runs the checkpoint against the current block timestamp and resolves
     ///         `marketId` if the accumulated-time threshold has been reached (Section 2.6.8 point 3) - the
     ///         mechanism that guarantees a case can never hang indefinitely even if no further trade ever occurs
-    ///         after crossing 87%. Pays whichever is smaller of {pokeBounty} or the remaining {bountyPool} to the
+    ///         after crossing 93%. Pays whichever is smaller of {pokeBounty} or the remaining {bountyPool} to the
     ///         caller; an underfunded bounty pool never blocks the resolution itself, only shrinks the reward.
     function pokeSettlement(uint256 marketId) external nonReentrant {
         (,,,, bool open, bool resolved,) = spectralMarket.markets(marketId);
@@ -146,21 +148,14 @@ contract SettlementConditions is ISettlementConditionsHook, ReentrancyGuard {
 
         emit Checkpointed(marketId, t.cumulativeGuilty, t.cumulativeInnocent);
 
-        if (priceGuilty >= INSTANT_THRESHOLD) {
-            emit ConditionAMet(marketId, true, priceGuilty);
-            return (true, true);
-        }
-        if (priceInnocent >= INSTANT_THRESHOLD) {
-            emit ConditionAMet(marketId, false, priceInnocent);
-            return (true, false);
-        }
-
+        // No price, however high (including 99% or effectively 100%, reached in a single trade), resolves the
+        // case here. Only accumulated time above CUMULATIVE_THRESHOLD, tracked across checkpoints, can.
         if (t.cumulativeGuilty >= CUMULATIVE_DURATION) {
-            emit ConditionBMet(marketId, true, t.cumulativeGuilty);
+            emit ResolutionMet(marketId, true, t.cumulativeGuilty);
             return (true, true);
         }
         if (t.cumulativeInnocent >= CUMULATIVE_DURATION) {
-            emit ConditionBMet(marketId, false, t.cumulativeInnocent);
+            emit ResolutionMet(marketId, false, t.cumulativeInnocent);
             return (true, false);
         }
 
