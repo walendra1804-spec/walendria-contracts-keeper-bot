@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {SD59x18, sd, ZERO} from "prb-math/SD59x18.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {LMSRMath} from "./LMSRMath.sol";
+import {ISettlementConditionsHook} from "./ISettlementConditionsHook.sol";
 
 /// @title SpectralMarket
 /// @notice The Spectral Market for Walendria Protocol "The 27" (Section 2.6): a purpose-built LMSR prediction
@@ -48,6 +49,13 @@ contract SpectralMarket is ReentrancyGuard {
     mapping(uint256 marketId => mapping(Side => mapping(address trader => uint256))) public sharesOf;
     mapping(address controller => bool) public isController;
 
+    /// @notice Called after every successful {buy}/{sell} (Section 2.6.8's checkpoint-on-trade). Address(0) is a
+    ///         valid, deliberate choice meaning "no condition tracking wired in" - useful for isolating pure
+    ///         market-mechanics tests from Phase 6's resolution-condition concerns; a real deployment must wire
+    ///         in a genuine SettlementConditions.sol, or price-based auto-resolution simply never triggers
+    ///         (direct controller-gated {resolveMarket} calls, e.g. DisputeManager's mutualClose, still work).
+    ISettlementConditionsHook public immutable settlementConditions;
+
     event MarketOpened(uint256 indexed marketId, uint256 b, uint256 sharesPerSide, uint256 totalPooled);
     event Bought(uint256 indexed marketId, Side indexed side, address indexed trader, uint256 shares, uint256 cost);
     event Sold(uint256 indexed marketId, Side indexed side, address indexed trader, uint256 shares, uint256 proceeds);
@@ -74,11 +82,14 @@ contract SpectralMarket is ReentrancyGuard {
 
     /// @param controllers Addresses authorized to call {openMarket}/{resolveMarket} (e.g. DisputeManager.sol,
     ///        SettlementConditions.sol). Fixed for the lifetime of this contract.
-    constructor(address[] memory controllers) {
+    /// @param _settlementConditions See {settlementConditions}. Immutable, like every other cross-contract
+    ///        address in this codebase - address(0) disables the hook (see {settlementConditions}'s doc).
+    constructor(address[] memory controllers, ISettlementConditionsHook _settlementConditions) {
         if (controllers.length == 0) revert NoControllers();
         for (uint256 i = 0; i < controllers.length; i++) {
             isController[controllers[i]] = true;
         }
+        settlementConditions = _settlementConditions;
     }
 
     modifier onlyController() {
@@ -178,6 +189,7 @@ contract SpectralMarket is ReentrancyGuard {
         sharesOf[marketId][side][msg.sender] += shares;
 
         emit Bought(marketId, side, msg.sender, shares, cost);
+        _checkpointAndMaybeResolve(marketId, m);
 
         uint256 refund = msg.value - cost;
         if (refund > 0) {
@@ -222,6 +234,7 @@ contract SpectralMarket is ReentrancyGuard {
         m.pooled -= proceeds;
 
         emit Sold(marketId, side, msg.sender, shares, proceeds);
+        _checkpointAndMaybeResolve(marketId, m);
 
         (bool ok,) = msg.sender.call{value: proceeds}("");
         if (!ok) revert TransferFailed(msg.sender, proceeds);
@@ -272,6 +285,29 @@ contract SpectralMarket is ReentrancyGuard {
         (SD59x18 pG, SD59x18 pI) = LMSRMath.price(m.qGuilty, m.qInnocent, m.b);
         pGuilty = uint256(SD59x18.unwrap(pG));
         pInnocent = uint256(SD59x18.unwrap(pI));
+    }
+
+    /// @notice Runs the checkpoint-on-trade hook (Section 2.6.8 point 1) after {buy}/{sell} have already applied
+    ///         their own state changes, using the now-current (post-trade) price - this is also what lets
+    ///         {ISettlementConditionsHook-checkpoint} implement Condition A (Section 2.6.5's instant 90%
+    ///         threshold) as "did the trade that just happened cross it", not a stale pre-trade snapshot. A no-op
+    ///         when {settlementConditions} is unset (see its own doc for why that is a deliberate, valid state).
+    function _checkpointAndMaybeResolve(uint256 marketId, Market storage m) internal {
+        if (address(settlementConditions) == address(0)) return;
+
+        (SD59x18 pG, SD59x18 pI) = LMSRMath.price(m.qGuilty, m.qInnocent, m.b);
+        // casting to 'uint256' is safe because LMSRMath.price() guarantees both results lie in [0, UNIT].
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 priceGuilty = uint256(SD59x18.unwrap(pG));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 priceInnocent = uint256(SD59x18.unwrap(pI));
+
+        (bool shouldResolve, bool guiltyWins) = settlementConditions.checkpoint(marketId, priceGuilty, priceInnocent);
+        if (shouldResolve) {
+            m.resolved = true;
+            m.winningSide = guiltyWins ? Side.Guilty : Side.Innocent;
+            emit MarketResolved(marketId, m.winningSide);
+        }
     }
 
     /// @dev A buy's cost is strictly positive for any dq > 0 from a valid state (C is strictly increasing in

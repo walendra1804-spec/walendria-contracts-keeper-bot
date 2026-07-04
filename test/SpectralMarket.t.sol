@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {SD59x18, sd, ZERO} from "prb-math/SD59x18.sol";
 import {LMSRMath} from "../src/LMSRMath.sol";
 import {SpectralMarket} from "../src/SpectralMarket.sol";
+import {ISettlementConditionsHook} from "../src/ISettlementConditionsHook.sol";
 
 /// @dev Reenters `market` with an arbitrary, test-configured calldata payload during its own `receive()`,
 ///      mirroring the ReentrantAttacker/ReentrantBuyer pattern already established in prior phases' tests.
@@ -61,7 +62,7 @@ contract SpectralMarketTest is Test {
     function setUp() public {
         address[] memory controllers = new address[](1);
         controllers[0] = controller;
-        market = new SpectralMarket(controllers);
+        market = new SpectralMarket(controllers, ISettlementConditionsHook(address(0)));
         vm.deal(controller, 1000 ether);
         vm.deal(guilty1, 1000 ether);
         vm.deal(guilty2, 1000 ether);
@@ -83,7 +84,7 @@ contract SpectralMarketTest is Test {
 
     function test_ConstructorRevertsOnEmptyControllers() public {
         vm.expectRevert(SpectralMarket.NoControllers.selector);
-        new SpectralMarket(new address[](0));
+        new SpectralMarket(new address[](0), ISettlementConditionsHook(address(0)));
     }
 
     // ── openMarket ─────────────────────────────────────────────────────────────────────────────────────────────

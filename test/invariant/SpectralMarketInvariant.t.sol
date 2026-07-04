@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {SD59x18} from "prb-math/SD59x18.sol";
 import {SpectralMarket} from "../../src/SpectralMarket.sol";
+import {ISettlementConditionsHook} from "../../src/ISettlementConditionsHook.sol";
 import {SpectralMarketHandler} from "../handlers/SpectralMarketHandler.sol";
 
 contract SpectralMarketInvariantTest is Test {
@@ -16,7 +17,7 @@ contract SpectralMarketInvariantTest is Test {
     function setUp() public {
         address[] memory controllers = new address[](1);
         controllers[0] = controller;
-        market = new SpectralMarket(controllers);
+        market = new SpectralMarket(controllers, ISettlementConditionsHook(address(0)));
 
         for (uint256 i = 0; i < 4; i++) {
             traders.push(makeAddr(string.concat("invTrader", vm.toString(i))));
