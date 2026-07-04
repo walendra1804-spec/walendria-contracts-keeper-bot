@@ -12,4 +12,8 @@ invariant = { runs = 32, depth = 100 }
 fuzz = { runs = 10000 }
 invariant = { runs = 256, depth = 500 }
 
+[rpc_endpoints]
+chiado = "https://rpc.chiadochain.net"
+anvil = "http://127.0.0.1:8545"
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
