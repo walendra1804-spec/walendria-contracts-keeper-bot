@@ -102,10 +102,12 @@ contract ListingManagerTest is Test {
 
     /// @notice Direct regression test named in the build strategy: a listing cannot be created with a
     ///         completion window below the protocol minimum.
-    function test_CreateListingRevertsWhenWindowBelowMinimum() public {
+    function testFuzz_CreateListingRevertsWhenWindowBelowMinimum(uint256 windowSeed) public {
+        uint256 window = bound(windowSeed, 0, WINDOW - 1);
+
         vm.prank(seller);
-        vm.expectRevert(abi.encodeWithSelector(ListingManager.CompletionWindowTooShort.selector, WINDOW - 1, WINDOW));
-        lm.createListing(PRICE, 1, WINDOW - 1);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.CompletionWindowTooShort.selector, window, WINDOW));
+        lm.createListing(PRICE, 1, window);
     }
 
     function test_CreateListingRevertsWhenInsufficientFreeIB() public {

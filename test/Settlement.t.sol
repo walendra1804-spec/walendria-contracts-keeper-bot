@@ -290,6 +290,29 @@ contract SettlementTest is Test {
         assertEq(address(settlement).balance, 0, "Settlement must never retain a balance");
     }
 
+    struct UnderpayState {
+        uint256 buyerBalance;
+        uint256 sellerBalance;
+        uint256 devBalance;
+        uint256 settlementBalance;
+        uint256 emptySlots;
+        ListingManager.SlotStatus slotStatus;
+        address slotBuyer;
+    }
+
+    function _captureUnderpayState(uint256 targetListingId, address fuzzBuyer)
+        internal
+        view
+        returns (UnderpayState memory s)
+    {
+        s.buyerBalance = fuzzBuyer.balance;
+        s.sellerBalance = seller.balance;
+        s.devBalance = devPool.balance;
+        s.settlementBalance = address(settlement).balance;
+        (,,, s.emptySlots,,,) = lm.listings(targetListingId);
+        (s.slotStatus,, s.slotBuyer) = lm.slots(targetListingId, 0);
+    }
+
     function testFuzz_RevertsWheneverUnderpaid(uint256 priceSeed, uint256 shortfallSeed) public {
         uint256 price = bound(priceSeed, 1, 1_000_000 ether);
         uint256 shortfall = bound(shortfallSeed, 1, price);
@@ -305,8 +328,21 @@ contract SettlementTest is Test {
         address fuzzBuyer = makeAddr(string.concat("fuzzUnderpay", vm.toString(priceSeed), vm.toString(shortfallSeed)));
         vm.deal(fuzzBuyer, sent);
 
+        UnderpayState memory before = _captureUnderpayState(freshListingId, fuzzBuyer);
+
         vm.prank(fuzzBuyer);
         vm.expectRevert(abi.encodeWithSelector(Settlement.InsufficientPayment.selector, sent, price));
         settlement.pay{value: sent}(freshListingId, 0);
+
+        // Prove the revert left genuinely zero partial state change, not just that it reverted.
+        UnderpayState memory afterRevert = _captureUnderpayState(freshListingId, fuzzBuyer);
+        assertEq(afterRevert.buyerBalance, before.buyerBalance, "buyer's ETH must be fully rolled back");
+        assertEq(afterRevert.sellerBalance, before.sellerBalance, "seller must not receive any proceeds");
+        assertEq(afterRevert.devBalance, before.devBalance, "dev pool must not receive any fee");
+        assertEq(afterRevert.settlementBalance, before.settlementBalance, "Settlement must not retain any balance");
+        assertEq(afterRevert.emptySlots, before.emptySlots, "emptySlots must be unchanged");
+        assertEq(uint256(afterRevert.slotStatus), uint256(before.slotStatus), "slot status must be unchanged");
+        assertEq(uint256(afterRevert.slotStatus), uint256(ListingManager.SlotStatus.Empty), "slot must still be Empty");
+        assertEq(afterRevert.slotBuyer, before.slotBuyer, "slot buyer must be unchanged");
     }
 }
