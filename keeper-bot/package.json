@@ -1,0 +1,14 @@
+{
+  "name": "walendria-keeper-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Permissionless pokeSettlement keeper for the Walendria Protocol Spectral Market (app strategy doc Section 3).",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "viem": "^2.54.2"
+  }
+}
