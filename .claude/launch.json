@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "walendria-app-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "D:/walendria-app", "run", "dev"],
+      "port": 3000
+    }
+  ]
+}
