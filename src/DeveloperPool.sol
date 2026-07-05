@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {SpectralMarket} from "./SpectralMarket.sol";
 
 /// @title DeveloperPool
 /// @notice Fee and surplus routing for Walendria Protocol "The 27" (Section 2.6.6, 2.6.7, 2.7): collects the 0.5%
@@ -92,6 +93,23 @@ contract DeveloperPool is ReentrancyGuard {
         if (sent == 0) return 0;
         (bool ok,) = msg.sender.call{value: sent}("");
         if (!ok) revert TransferFailed(msg.sender, sent);
+    }
+
+    /// @notice Permissionlessly redeems this contract's own winning-side shares (if any) in `marketId` on
+    ///         `market`. The Section 2.6.7 liquidity-buffer top-up credits this contract identically on both
+    ///         sides of a joint injection (see {SpectralMarket-_creditSide}), so only the winning side is ever
+    ///         redeemable - this contract itself never trades, so that is the only source it could ever hold
+    ///         shares from.
+    /// @dev A no-op, not a revert, when nothing is owed: the overwhelming majority of disputes never needed a
+    ///      top-up at all, and {SpectralMarket-redeem} reverts on a zero balance. Swallowing that (or any other)
+    ///      revert via try/catch lets DisputeManager.sol call this unconditionally as part of every dispute's
+    ///      finalization, without first checking whether this contract has anything to claim.
+    function redeemFromMarket(SpectralMarket market, uint256 marketId) external nonReentrant returns (uint256 payout) {
+        try market.redeem(marketId) returns (uint256 p) {
+            payout = p;
+        } catch {
+            payout = 0;
+        }
     }
 
     /// @notice Accepts the Developer Fee (Settlement.sol) and resolution surplus (SpectralMarket.sol) - both

@@ -3,6 +3,8 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {DeveloperPool} from "../src/DeveloperPool.sol";
+import {SpectralMarket} from "../src/SpectralMarket.sol";
+import {ISettlementConditionsHook} from "../src/ISettlementConditionsHook.sol";
 
 /// @dev Reenters `pool` with an arbitrary, test-configured calldata payload during its own `receive()`, mirroring
 ///      the ReentrantAttacker pattern already established throughout this codebase.
@@ -245,5 +247,31 @@ contract DeveloperPoolTest is Test {
         assertLe(sent, balance);
         assertEq(sent, request < balance ? request : balance);
         assertEq(address(pool).balance, balance - sent);
+    }
+
+    // ── redeemFromMarket ───────────────────────────────────────────────────────────────────────────────────────
+
+    /// @notice Isolated proof that the try/catch actually swallows the revert: a market that was never opened
+    ///         (so SpectralMarket.redeem reverts with MarketNotResolved) must produce a graceful zero payout, not
+    ///         a bubbled-up revert. DisputeManager.t.sol covers the real end-to-end successful-redemption path.
+    function test_RedeemFromMarketIsNoOpWhenMarketNotResolved() public {
+        address[] memory marketControllers = new address[](1);
+        marketControllers[0] = address(this);
+        SpectralMarket market =
+            new SpectralMarket(marketControllers, ISettlementConditionsHook(address(0)), address(pool));
+
+        uint256 payout = pool.redeemFromMarket(market, 0);
+        assertEq(payout, 0, "must gracefully no-op, not revert, when the market was never opened/resolved");
+    }
+
+    function test_RedeemFromMarketIsPermissionless() public {
+        address[] memory marketControllers = new address[](1);
+        marketControllers[0] = address(this);
+        SpectralMarket market =
+            new SpectralMarket(marketControllers, ISettlementConditionsHook(address(0)), address(pool));
+
+        vm.prank(stranger);
+        uint256 payout = pool.redeemFromMarket(market, 0);
+        assertEq(payout, 0, "callable by anyone, same as SpectralMarket.sweepSurplus");
     }
 }

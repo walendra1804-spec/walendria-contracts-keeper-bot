@@ -981,10 +981,12 @@ contract DisputeManagerLiquidityBufferTest is Test {
         assertEq(market.sharesOf(marketId, SpectralMarket.Side.Guilty, address(devPool)), 0);
     }
 
-    /// @notice Direct regression test: once DeveloperPool has real capital staked on both sides from a buffer
-    ///         top-up, it is a genuine third party at risk in the outcome - mutualClose must permanently disable,
-    ///         exactly as it would for any other third-party backer (Phase 7).
-    function test_LiquidityBufferTopUpDisablesMutualClose() public {
+    /// @notice DeveloperPool's liquidity-buffer stake is credited identically on both sides and can never be
+    ///         actively traded (DeveloperPool.sol exposes no function that calls buy/sell) - whichever verdict
+    ///         wins, it recovers exactly what it put in. The buyer and seller have nothing to gain by colluding
+    ///         on a verdict at its expense, so unlike a genuine third-party backer, its presence must not block
+    ///         mutualClose.
+    function test_MutualCloseSucceedsDespiteLiquidityBufferTopUp() public {
         vm.deal(address(devPool), 10 ether);
         uint256 price = 1 ether;
         uint256 listingId = _openConfirmedListing(price);
@@ -992,6 +994,84 @@ contract DisputeManagerLiquidityBufferTest is Test {
 
         vm.prank(buyer);
         dm.fundGuiltySide{value: price / 2}(listingId, 0);
+
+        uint256 devPoolGuiltyBefore = market.sharesOf(marketId, SpectralMarket.Side.Guilty, address(devPool));
+        assertGt(devPoolGuiltyBefore, 0, "this test only proves what it claims if the top-up actually happened");
+        uint256 devPoolBalanceBefore = address(devPool).balance;
+
+        vm.prank(buyer);
+        dm.mutualClose(listingId, 0, SpectralMarket.Side.Innocent);
+        vm.prank(seller);
+        dm.mutualClose(listingId, 0, SpectralMarket.Side.Innocent);
+
+        (,,,,, bool resolved, SpectralMarket.Side winningSide) = market.markets(marketId);
+        assertTrue(resolved, "mutualClose must succeed despite DeveloperPool holding a neutral stake on both sides");
+        assertEq(uint8(winningSide), uint8(SpectralMarket.Side.Innocent));
+
+        // _finalize auto-triggers DeveloperPool.redeemFromMarket in the same transaction - its winning-side
+        // (Innocent) shares are claimed automatically, landing back in its own balance with no separate call.
+        assertEq(
+            market.sharesOf(marketId, SpectralMarket.Side.Innocent, address(devPool)),
+            0,
+            "DeveloperPool's winning-side shares must be auto-redeemed, not left outstanding"
+        );
+        assertEq(
+            address(devPool).balance,
+            devPoolBalanceBefore + devPoolGuiltyBefore,
+            "DeveloperPool must recover exactly what it contributed, automatically"
+        );
+    }
+
+    /// @notice The same auto-redeem must fire on the other resolution path too - finalizeDispute, reached after
+    ///         price-threshold/poke resolution rather than mutualClose. _finalize is the shared helper, but both
+    ///         call sites are worth proving independently rather than assuming the shared helper is enough.
+    function test_FinalizeDisputeAutoRedeemsDeveloperPoolAfterLiquidityBufferTopUp() public {
+        vm.deal(address(devPool), 10 ether);
+        uint256 price = 1 ether;
+        uint256 listingId = _openConfirmedListing(price);
+        uint256 marketId = dm.marketIdOf(listingId, 0);
+
+        vm.prank(buyer);
+        dm.fundGuiltySide{value: price / 2}(listingId, 0);
+
+        uint256 devPoolGuiltyBefore = market.sharesOf(marketId, SpectralMarket.Side.Guilty, address(devPool));
+        assertGt(devPoolGuiltyBefore, 0, "this test only proves what it claims if the top-up actually happened");
+        uint256 devPoolBalanceBefore = address(devPool).balance;
+
+        vm.prank(priceController);
+        market.resolveMarket(marketId, SpectralMarket.Side.Guilty);
+
+        vm.prank(buyer); // permissionless in practice, but any caller works
+        dm.finalizeDispute(listingId, 0);
+
+        assertEq(
+            market.sharesOf(marketId, SpectralMarket.Side.Guilty, address(devPool)),
+            0,
+            "DeveloperPool's winning-side shares must be auto-redeemed via finalizeDispute too"
+        );
+        assertEq(
+            address(devPool).balance,
+            devPoolBalanceBefore + devPoolGuiltyBefore,
+            "DeveloperPool must recover exactly what it contributed, automatically, via this path as well"
+        );
+    }
+
+    /// @notice Belt-and-suspenders regression: DeveloperPool's exemption must not let a genuine third party hide
+    ///         behind it. A real backer trading on top of a buffer-topped-up market still permanently blocks
+    ///         mutualClose, identical to Phase 7's original third-party protection.
+    function test_GenuineThirdPartyStillBlocksMutualCloseEvenWithLiquidityBufferPresent() public {
+        vm.deal(address(devPool), 10 ether);
+        uint256 price = 1 ether;
+        uint256 listingId = _openConfirmedListing(price);
+        uint256 marketId = dm.marketIdOf(listingId, 0);
+
+        vm.prank(buyer);
+        dm.fundGuiltySide{value: price / 2}(listingId, 0);
+
+        address backer = makeAddr("bufferTestBacker");
+        vm.deal(backer, 10 ether);
+        vm.prank(backer);
+        market.buy{value: 0.1 ether}(marketId, SpectralMarket.Side.Guilty, 0.05 ether);
 
         vm.prank(buyer);
         vm.expectRevert(

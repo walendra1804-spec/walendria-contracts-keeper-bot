@@ -175,11 +175,13 @@ contract DisputeManager is ReentrancyGuard {
     ///
     ///      Slither flags `disputes[marketId].finalized = true` (set inside {_finalize}) as written after the
     ///      external calls to `spectralMarket.resolveMarket` and `_finalize`'s own calls into IntegrityBond/
-    ///      ListingManager. Manually verified false-positive-in-practice: none of those three are attacker-
-    ///      controlled or call back into this contract (spectralMarket.resolveMarket only mutates its own
-    ///      storage; IntegrityBond's slash/unlock touch only mappings; ListingManager.resolveDispute is the
-    ///      same), and this function is itself nonReentrant regardless - same trust model already accepted for
-    ///      SpectralMarket's own call into SettlementConditions (Phase 6).
+    ///      ListingManager/DeveloperPool. Manually verified false-positive-in-practice: none of those four are
+    ///      attacker-controlled or call back into this contract (spectralMarket.resolveMarket only mutates its
+    ///      own storage; IntegrityBond's slash/unlock touch only mappings; ListingManager.resolveDispute is the
+    ///      same; DeveloperPool.redeemFromMarket's own external call - SpectralMarket.redeem - sends value only
+    ///      to DeveloperPool.sol's own `receive()`, which does nothing but emit an event), and this function is
+    ///      itself nonReentrant regardless - same trust model already accepted for SpectralMarket's own call into
+    ///      SettlementConditions (Phase 6).
     function mutualClose(uint256 listingId, uint256 slotIndex, SpectralMarket.Side verdict) external nonReentrant {
         uint256 marketId = marketIdOf(listingId, slotIndex);
         if (!disputes[marketId].opened) revert DisputeNotOpen(marketId);
@@ -348,11 +350,19 @@ contract DisputeManager is ReentrancyGuard {
     }
 
     /// @dev The no-third-party-holder invariant (Section 2.6.10, "the entire safety property of the function" per
-    ///      the build strategy): the buyer must currently hold every outstanding Guilty share, and the seller must
-    ///      currently hold every outstanding Innocent share, AND each side must have had exactly one distinct
-    ///      holder for its entire history - the second condition is what keeps this permanently disabled once
-    ///      violated, even if the intervening third party later sells back down to zero (see
-    ///      {SpectralMarket-distinctHolderCount}'s doc for why the first condition alone is insufficient for that).
+    ///      the build strategy): the buyer and {developerPool} together must currently hold every outstanding
+    ///      Guilty share, the seller and {developerPool} together must currently hold every outstanding Innocent
+    ///      share, AND each side must have had exactly one distinct *counted* holder for its entire history - the
+    ///      second condition is what keeps this permanently disabled once a genuine third party ever holds a
+    ///      share, even after they later sell back down to zero (see {SpectralMarket-distinctHolderCount}'s doc
+    ///      for why the first condition alone is insufficient for that).
+    ///
+    ///      {developerPool} is deliberately excluded from both the holder count (see
+    ///      {SpectralMarket-_creditSide}'s doc) and, here, from the exact-match check: it can hold a share of
+    ///      either side (Section 2.6.7's liquidity-buffer top-up for disputes too small to hit the depth floor on
+    ///      their own) without that counting as third-party participation, because it always holds the identical
+    ///      amount on both sides and never trades afterward - whichever verdict wins, it recovers exactly what it
+    ///      put in. There is nothing for the buyer and seller to collude to take from it.
     function _requireNoThirdParty(uint256 marketId, address buyer, address seller) internal view {
         // unwrap()->uint256 is safe because qGuilty/qInnocent are cumulative sums of non-negative share credits
         // (SpectralMarket's own invariant tests confirm they never go negative), mirroring the same safety
@@ -361,15 +371,21 @@ contract DisputeManager is ReentrancyGuard {
         uint256 totalGuilty = uint256(SD59x18.unwrap(qGuilty));
         uint256 totalInnocent = uint256(SD59x18.unwrap(qInnocent));
 
+        uint256 buyerGuilty = spectralMarket.sharesOf(marketId, SpectralMarket.Side.Guilty, buyer);
+        uint256 devPoolGuilty = spectralMarket.sharesOf(marketId, SpectralMarket.Side.Guilty, address(developerPool));
         if (
             spectralMarket.distinctHolderCount(marketId, SpectralMarket.Side.Guilty) != 1
-                || spectralMarket.sharesOf(marketId, SpectralMarket.Side.Guilty, buyer) != totalGuilty
+                || buyerGuilty + devPoolGuilty != totalGuilty
         ) {
             revert ThirdPartyParticipation(marketId, SpectralMarket.Side.Guilty);
         }
+
+        uint256 sellerInnocent = spectralMarket.sharesOf(marketId, SpectralMarket.Side.Innocent, seller);
+        uint256 devPoolInnocent =
+            spectralMarket.sharesOf(marketId, SpectralMarket.Side.Innocent, address(developerPool));
         if (
             spectralMarket.distinctHolderCount(marketId, SpectralMarket.Side.Innocent) != 1
-                || spectralMarket.sharesOf(marketId, SpectralMarket.Side.Innocent, seller) != totalInnocent
+                || sellerInnocent + devPoolInnocent != totalInnocent
         ) {
             revert ThirdPartyParticipation(marketId, SpectralMarket.Side.Innocent);
         }
@@ -381,6 +397,12 @@ contract DisputeManager is ReentrancyGuard {
     ///      either way, and `perSlotLocked - halfPrice` is exactly "whatever this slot still has locked" regardless
     ///      of price's parity (Section 3.1's "remaining 1.0P" and Section 3.2's "remaining 1.0P, untouched" both
     ///      mean this same quantity, not a separately-computed constant).
+    ///
+    ///      Also triggers {DeveloperPool-redeemFromMarket} whenever {developerPool} is set (the same "unset is a
+    ///      valid state" guard already used at {_pullLiquidityBufferIfNeeded}): if a Section 2.6.7 liquidity-
+    ///      buffer top-up ever credited it a stake in this market, its winning-side shares are claimed
+    ///      automatically in this same transaction rather than depending on a separate manual call nobody is
+    ///      obligated to make. A genuine no-op (not a revert) for the common case where no top-up ever happened.
     function _finalize(
         uint256 listingId,
         uint256 slotIndex,
@@ -404,6 +426,9 @@ contract DisputeManager is ReentrancyGuard {
         }
 
         listingManager.resolveDispute(listingId, slotIndex);
+        if (address(developerPool) != address(0)) {
+            developerPool.redeemFromMarket(spectralMarket, marketId);
+        }
 
         emit DisputeFinalized(marketId, winningSide, remainingLocked);
     }

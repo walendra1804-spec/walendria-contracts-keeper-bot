@@ -386,12 +386,28 @@ contract SpectralMarket is ReentrancyGuard {
     }
 
     /// @dev Credits `side` shares to each of `recipients` in proportion to `amounts` (2x, per {openMarket}'s
-    ///      unbiased-50/50-opening identity), marking each as a holder for {distinctHolderCount}.
+    ///      unbiased-50/50-opening identity), marking each as a holder for {distinctHolderCount} - except
+    ///      {developerPool} itself, which is deliberately never marked.
+    ///
+    ///      {developerPool} can only ever appear here via DisputeManager's Section 2.6.7 liquidity-buffer top-up
+    ///      (see its `_buildGuiltyArrays`/`_buildInnocentArrays`), which always credits it the *identical* amount
+    ///      on both Guilty and Innocent in the same joint injection - never afterward, since DeveloperPool.sol
+    ///      exposes no function that calls {buy}/{sell}. Whichever side wins, its winning-side shares redeem for
+    ///      exactly what it contributed and its losing-side shares are worth exactly what it forfeits on that
+    ///      side - net effect is always a wash. Mutual-close's third-party check (DisputeManager's
+    ///      `_requireNoThirdParty`) exists to stop the buyer and seller colluding on a verdict at a third party's
+    ///      expense; a party with no directional stake in the outcome cannot be the victim of that collusion, so
+    ///      counting it as a "third party" would only ever block mutual-close for disputes too small to hit
+    ///      Section 2.6.7's depth floor on their own - not protect anyone. A genuine third-party trader is
+    ///      completely unaffected: it still reaches this function only through {buy}, which calls {_markHolder}
+    ///      directly and is never skipped.
     function _creditSide(uint256 marketId, Side side, address[] calldata recipients, uint256[] calldata amounts)
         private
     {
         for (uint256 i = 0; i < recipients.length; i++) {
-            _markHolder(marketId, side, recipients[i]);
+            if (recipients[i] != developerPool) {
+                _markHolder(marketId, side, recipients[i]);
+            }
             sharesOf[marketId][side][recipients[i]] += amounts[i] * 2;
         }
     }

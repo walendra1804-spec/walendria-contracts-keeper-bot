@@ -104,14 +104,14 @@ contract DeployScript is Script {
         internal
         returns (SettlementConditions conditions, SpectralMarket market)
     {
-        conditions =
-            new SettlementConditions{value: cfg.initialBountyFunding}(SpectralMarket(p.spectralMarket), cfg.pokeBounty);
+        conditions = new SettlementConditions{value: cfg.initialBountyFunding}(
+            SpectralMarket(p.spectralMarket), cfg.pokeBounty
+        );
 
         address[] memory marketControllers = new address[](2);
         marketControllers[0] = p.dm;
         marketControllers[1] = address(conditions);
-        market =
-            new SpectralMarket(marketControllers, ISettlementConditionsHook(address(conditions)), address(devPool));
+        market = new SpectralMarket(marketControllers, ISettlementConditionsHook(address(conditions)), address(devPool));
         require(address(market) == p.spectralMarket, "CREATE nonce prediction drifted (market)");
     }
 
