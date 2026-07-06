@@ -20,7 +20,9 @@ function emptyState() {
 function load() {
   if (!fs.existsSync(DB_PATH)) return emptyState();
   try {
-    return JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+    // Merge onto emptyState() so a data.json persisted before a new bucket (e.g. `evidence`) was
+    // introduced still gets that key populated, instead of leaving it undefined for older files.
+    return { ...emptyState(), ...JSON.parse(fs.readFileSync(DB_PATH, "utf8")) };
   } catch {
     return emptyState();
   }
