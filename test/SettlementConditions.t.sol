@@ -257,6 +257,62 @@ contract SettlementConditionsTest is Test {
         assertEq(uint256(winningSide), uint256(SpectralMarket.Side.Guilty));
     }
 
+    /// @notice Distinct failure mode from the pause-not-reset test above: cumulativeGuilty and cumulativeInnocent
+    ///         are independent counters, keyed separately in storage - a side *flip* (price swinging hard enough
+    ///         to cross the threshold on the *opposite* side, not just dipping below it) must never let one
+    ///         side's already-accumulated time leak into the other's counter. Accrues 30 minutes on Guilty, then
+    ///         flips the market decisively to >=93% Innocent, and verifies cumulativeGuilty freezes at exactly 30
+    ///         minutes (never reset, never carried over) while cumulativeInnocent starts from zero and must
+    ///         independently accumulate its own full hour before resolving.
+    function test_SideFlipDoesNotLeakElapsedTimeBetweenGuiltyAndInnocentCounters() public {
+        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
+        vm.prank(buyer);
+        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
+
+        vm.warp(block.timestamp + 30 minutes);
+        vm.prank(buyer);
+        market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Guilty, 1e9); // checkpoint: +30min to Guilty
+
+        (uint256 cumulativeGuiltyMid, uint256 cumulativeInnocentMid,,,,) = conditions.tracking(MARKET_ID);
+        assertEq(cumulativeGuiltyMid, 30 minutes, "30 minutes above 93% Guilty must be credited");
+        assertEq(cumulativeInnocentMid, 0, "Innocent has never crossed threshold yet");
+
+        // Flip decisively: sell almost the entire Guilty position, then buy heavily into Innocent to cross
+        // >=93% the other way - flipping sides in a single checkpoint is not itself a resolution.
+        uint256 heldByBuyer = market.sharesOf(MARKET_ID, SpectralMarket.Side.Guilty, buyer);
+        vm.prank(buyer);
+        market.sell(MARKET_ID, SpectralMarket.Side.Guilty, heldByBuyer - 1e9, 0);
+        vm.prank(buyer);
+        market.buy{value: 50 ether}(MARKET_ID, SpectralMarket.Side.Innocent, _sharesToReachPrice(B, 0.99e18));
+        (, uint256 pInnocentAfterFlip) = market.currentPrice(MARKET_ID);
+        assertGe(pInnocentAfterFlip, 0.93e18, "must genuinely flip to >=93% Innocent for this test to be meaningful");
+
+        (uint256 cumulativeGuiltyAfterFlip, uint256 cumulativeInnocentAfterFlip,,,,) = conditions.tracking(MARKET_ID);
+        assertEq(cumulativeGuiltyAfterFlip, 30 minutes, "Guilty's counter must freeze, not reset or keep accruing");
+        assertEq(cumulativeInnocentAfterFlip, 0, "Innocent must start from zero, never inheriting Guilty's elapsed time");
+
+        (bool resolvedRightAfterFlip,) = _isResolved(MARKET_ID);
+        assertFalse(resolvedRightAfterFlip, "flipping sides is not itself a resolution event");
+
+        // 59 more minutes on Innocent: must NOT resolve yet. If the two counters were ever summed instead of
+        // tracked independently, Guilty's frozen 30min + this 59min would wrongly cross the 1-hour threshold.
+        vm.warp(block.timestamp + 59 minutes);
+        vm.prank(buyer);
+        market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Innocent, 1e9);
+        (bool resolvedAt59Min,) = _isResolved(MARKET_ID);
+        assertFalse(
+            resolvedAt59Min, "Innocent alone has only accrued 59 minutes; Guilty's frozen 30min must not count toward it"
+        );
+
+        // Just over 1 more minute crosses Innocent's own full, independent hour.
+        vm.warp(block.timestamp + 1 minutes + 1);
+        vm.prank(buyer);
+        market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Innocent, 1e9);
+        (bool resolvedFinal, SpectralMarket.Side winningSideFinal) = _isResolved(MARKET_ID);
+        assertTrue(resolvedFinal, "Innocent's own independent 1 hour must resolve the case");
+        assertEq(uint256(winningSideFinal), uint256(SpectralMarket.Side.Innocent));
+    }
+
     // ── pokeSettlement ─────────────────────────────────────────────────────────────────────────────────────────
 
     function test_PokeSettlementResolvesWithZeroFurtherTradesAfterThresholdCrossing() public {
