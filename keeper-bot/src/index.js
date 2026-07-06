@@ -5,6 +5,7 @@ import {
   ADDRESSES,
   CHAIN,
   DEPLOYMENT_BLOCK,
+  INDEX_INTERVAL_MS,
   POLL_INTERVAL_MS,
   RPC_URL,
   disputeManagerAbi,
@@ -12,6 +13,8 @@ import {
   settlementConditionsAbi,
   spectralMarketAbi,
 } from "./config.js";
+import { runIndexer } from "./indexer.js";
+import { startServer } from "./server.js";
 
 if (!process.env.PRIVATE_KEY) {
   console.error("Missing PRIVATE_KEY in .env — see .env.example. Refusing to start.");
@@ -100,25 +103,49 @@ async function tick() {
   }
 }
 
-async function main() {
-  const balance = await publicClient.getBalance({ address: account.address });
-  log(`Walendria keeper bot starting.`);
-  log(`Wallet: ${account.address} (balance: ${formatEther(balance)} xDAI)`);
-  log(`Chain: ${CHAIN.name} via ${RPC_URL}`);
-  log(`Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
-  if (balance === 0n) {
-    log(`WARNING: wallet balance is 0 — pokeSettlement calls will fail until it's funded with test xDAI.`);
-  }
-
+async function pokeLoop() {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
       await tick();
     } catch (err) {
-      log(`Tick failed: ${err.message}`);
+      log(`Poke tick failed: ${err.message}`);
     }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
+}
+
+async function indexLoop() {
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      await runIndexer(publicClient);
+    } catch (err) {
+      log(`Index tick failed: ${err.message}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, INDEX_INTERVAL_MS));
+  }
+}
+
+async function main() {
+  const balance = await publicClient.getBalance({ address: account.address });
+  log(`Walendria keeper bot starting.`);
+  log(`Wallet: ${account.address} (balance: ${formatEther(balance)} xDAI)`);
+  log(`Chain: ${CHAIN.name} via ${RPC_URL}`);
+  log(`Poke check interval: ${POLL_INTERVAL_MS / 1000}s, index interval: ${INDEX_INTERVAL_MS / 1000}s`);
+  if (balance === 0n) {
+    log(`WARNING: wallet balance is 0 — pokeSettlement calls will fail until it's funded with test xDAI.`);
+  }
+
+  try {
+    startServer();
+  } catch (err) {
+    log(`HTTP server failed to start: ${err.message} — indexed data will still be written, just not servable.`);
+  }
+
+  // Both loops run concurrently and independently — a stall or crash in one (e.g. the poke loop hitting a
+  // bad RPC response) never blocks the other.
+  await Promise.all([pokeLoop(), indexLoop()]);
 }
 
 main();

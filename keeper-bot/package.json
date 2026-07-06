@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Permissionless pokeSettlement keeper for the Walendria Protocol Spectral Market (app strategy doc Section 3).",
+  "description": "Permissionless pokeSettlement keeper + lightweight event indexer for the Walendria Protocol (app strategy doc Sections 1, 3).",
   "scripts": {
     "start": "node src/index.js"
   },
