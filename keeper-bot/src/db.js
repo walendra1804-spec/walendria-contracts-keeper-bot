@@ -14,7 +14,7 @@ const DB_PATH = process.env.DB_PATH || path.join(__dirname, "..", "data.json");
  * the bottleneck — not expected for a long time at this deployment's actual usage.
  */
 function emptyState() {
-  return { meta: {}, listings: {}, disputes: {}, marketEvents: {} };
+  return { meta: {}, listings: {}, disputes: {}, marketEvents: {}, evidence: {} };
 }
 
 function load() {
@@ -66,6 +66,15 @@ export function insertMarketEvents(records) {
   persist();
 }
 
+export function insertEvidence(records) {
+  if (records.length === 0) return;
+  for (const r of records) {
+    const key = `${r.marketId}:${r.blockNumber}:${r.logIndex}`;
+    state.evidence[key] = r;
+  }
+  persist();
+}
+
 export function getListings(seller) {
   const all = Object.values(state.listings);
   const filtered = seller ? all.filter((l) => l.seller.toLowerCase() === seller.toLowerCase()) : all;
@@ -78,6 +87,15 @@ export function getDisputes() {
 
 export function getMarketEvents(marketId) {
   return Object.values(state.marketEvents)
+    .filter((e) => e.marketId === marketId)
+    .sort((a, b) => {
+      const blockDiff = Number(BigInt(a.blockNumber) - BigInt(b.blockNumber));
+      return blockDiff !== 0 ? blockDiff : a.logIndex - b.logIndex;
+    });
+}
+
+export function getEvidence(marketId) {
+  return Object.values(state.evidence)
     .filter((e) => e.marketId === marketId)
     .sort((a, b) => {
       const blockDiff = Number(BigInt(a.blockNumber) - BigInt(b.blockNumber));

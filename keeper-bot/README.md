@@ -60,11 +60,25 @@ Currently hardcoded to the live Gnosis Chiado deployment.
    nohup node src/index.js > keeper.log 2>&1 &
    ```
 
-5. **If walendria-app runs somewhere else** (e.g. Vercel) and needs to reach this indexer's HTTP API, open
-   `HTTP_PORT` (default 4000) in the VPS's firewall for inbound traffic, and set `INDEXER_URL` in
-   walendria-app's environment to `http://<vps-ip>:4000` (or a domain/reverse proxy in front of it, if you
-   set one up — a raw IP:port works fine for testnet). If `INDEXER_URL` is left unset, walendria-app falls
-   back to its original direct-RPC scan automatically — nothing breaks either way.
+5. **If walendria-app runs somewhere else** (e.g. Vercel) and needs to reach this indexer's HTTP API, set
+   `INDEXER_URL` in walendria-app's environment (both local `.env.local` for dev, **and** the deployed
+   host's env vars — e.g. Vercel project settings, easy to forget when only testing locally):
+
+   ```
+   INDEXER_URL=https://indexer.walendria.org
+   ```
+
+   **Why this URL and not `http://<vps-ip>:4000` directly:** this VPS's firewall only allows inbound
+   traffic on the SSH port — opening `HTTP_PORT` (4000) further costs extra with this provider. Since a
+   Cloudflare Tunnel (`cloudflared`, already running as a systemd service — see
+   `/etc/cloudflared/config.yml`) was already in place for `walendria.org`, `indexer.walendria.org` was
+   added as one more ingress rule on that same tunnel instead. This needs **zero open inbound ports** (the
+   tunnel is an outbound-only connection from the VPS to Cloudflare) and gets free HTTPS. If the tunnel
+   config ever needs to change, the ingress list is in `/etc/cloudflared/config.yml` on the VPS; reload
+   with `systemctl restart cloudflared` after editing.
+
+   If `INDEXER_URL` is left unset anywhere, walendria-app falls back to its original direct-RPC scan
+   automatically — nothing breaks either way, this is a performance upgrade only.
 
 ## Notes
 

@@ -11,6 +11,7 @@ import {SettlementConditions} from "../src/SettlementConditions.sol";
 import {DisputeManager} from "../src/DisputeManager.sol";
 import {DeveloperPool} from "../src/DeveloperPool.sol";
 import {SharedIB} from "../src/SharedIB.sol";
+import {EvidenceRegistry} from "../src/EvidenceRegistry.sol";
 
 /// @notice Phase 11 testnet deployment. Replicates Integration.t.sol's proven wiring order exactly - same
 ///         CREATE-nonce address prediction, same seven-contract dependency graph - so this script's correctness
@@ -52,6 +53,7 @@ contract DeployScript is Script {
         (SettlementConditions conditions, SpectralMarket market) = _deployMarket(cfg, predicted, devPool);
         (Settlement settlement, DisputeManager dm) = _deploySettlementAndDispute(predicted, lm, bond, market, devPool);
         SharedIB sharedIB = _deploySharedIB(cfg.deployer);
+        EvidenceRegistry evidenceRegistry = new EvidenceRegistry(lm);
 
         vm.stopBroadcast();
 
@@ -63,6 +65,7 @@ contract DeployScript is Script {
         console.log("Settlement:           ", address(settlement));
         console.log("DisputeManager:       ", address(dm));
         console.log("SharedIB (standalone):", address(sharedIB));
+        console.log("EvidenceRegistry:     ", address(evidenceRegistry));
     }
 
     function _readConfig() internal returns (DeployConfig memory cfg) {

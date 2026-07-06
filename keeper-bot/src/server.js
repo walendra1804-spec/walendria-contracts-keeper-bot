@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { HTTP_PORT } from "./config.js";
-import { getListings, getDisputes, getMarketEvents, getMeta } from "./db.js";
+import { getListings, getDisputes, getMarketEvents, getEvidence, getMeta } from "./db.js";
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}] [server]`, ...args);
@@ -43,6 +43,11 @@ export function startServer() {
       const marketTradesMatch = url.pathname.match(/^\/events\/market\/(\d+)\/trades$/);
       if (marketTradesMatch) {
         return sendJson(res, 200, getMarketEvents(marketTradesMatch[1]));
+      }
+
+      const marketEvidenceMatch = url.pathname.match(/^\/events\/market\/(\d+)\/evidence$/);
+      if (marketEvidenceMatch) {
+        return sendJson(res, 200, getEvidence(marketEvidenceMatch[1]));
       }
 
       sendJson(res, 404, { error: "Not found" });
