@@ -124,49 +124,104 @@ dead code and should be removed in the same change, not left orphaned:
 
 ---
 
-## Percentage-based pokeSettlement bounty with a gas-cost floor
+## Percentage-based pokeSettlement bounty (0.1% of P), paid from the market surplus
 
 **Status:** Agreed in principle (2026-07-07 discussion) — not started.
 
 **What:** Replace the fixed `pokeBounty` constant with a bounty proportional to the transaction's own price
-P, so the incentive scales with dispute size instead of being one constant that's oversized for a tiny
-transaction and potentially undersized for a huge one. Add a floor beneath it so the bounty never falls
-below what it actually costs in gas to call `pokeSettlement` — otherwise a percentage-based bounty makes
-tiny disputes (which this protocol explicitly supports, see the liquidity-buffer removal above) *worse* to
-poke than today's flawed-but-fixed amount, undermining Section 2.6.8's permissionless-resolution guarantee
-for exactly the transactions this protocol just committed to treating as first-class.
+P, so the incentive scales with dispute size instead of one constant that is oversized for a tiny transaction
+and undersized for a huge one. Set it at **0.1% of P** (`pokeBountyBps = 10`), and **source it from the
+market's own settlement surplus** — the residual pool that already flows to the Developer Pool under
+whitepaper Section 2.6.6 once a resolved market has paid its winning shares. At settlement the surplus is
+split: **0.1% of P skimmed to whoever successfully called `pokeSettlement`, the remainder to the Developer
+Pool (the founder wallet) exactly as today.** No separately-funded `bountyPool`, and no `DeveloperPool`
+gas-floor pull — both are removed by this change.
 
-**Why not pure percentage (rejected):** gas cost to call `pokeSettlement` doesn't shrink with P. A pure
-percentage bounty on a very small P could be smaller than the gas needed to submit the call, so nobody would
-ever bother — worse than the current oversized-but-workable fixed 0.001 xDAI, not better.
+**Why 0.1%, and why from the surplus (2026-07-07 decision):** an earlier sketch in this file paid a 1%
+bounty from a manually-funded `bountyPool`, topped up from the Developer Pool when short. The user replaced
+both choices: the rate drops to 0.1%, and the source becomes the market surplus itself, so the bounty is
+paid out of money the dispute's own trading generated rather than a pre-funded pot that has to be replenished
+(today's live failure mode: `bountyPool` is currently 0 on Chiado, so a poke pays nothing). This also deletes
+more code than it adds — `bountyPool`, `fundBounty()`, and the `DeveloperPool` gas-floor pull all disappear,
+on top of the liquidity-buffer cascade above.
 
 **Design sketch:**
 ```solidity
-// SettlementConditions.sol — replace the immutable pokeBounty constant:
-uint256 public immutable pokeBountyBps;      // e.g. 100 = 1% of the transaction's b (b == P at open, Section 2.6.4)
-uint256 public immutable pokeGasFloor;       // deployment-time estimate: measured pokeSettlement gas cost * expected gas price + margin
+// SettlementConditions.sol — replace the fixed pokeBounty constant with a bps rate:
+uint256 public immutable pokeBountyBps;   // 10 = 0.1% of P (b == P at open, Section 2.6.4)
 
-function _computeBounty(uint256 marketId) internal view returns (uint256) {
-    (uint256 b, , , , , ,) = spectralMarket.markets(marketId);   // b == P at market-open time
-    uint256 percentageBounty = (b * pokeBountyBps) / 10_000;
-    return percentageBounty > pokeGasFloor ? percentageBounty : pokeGasFloor;
-}
+// At resolution (inside pokeSettlement, or wherever the surplus is finalized), before the surplus
+// is swept to the Developer Pool:
+//   uint256 surplus     = totalPooled - totalWinningPayout;      // >= 0 by construction
+//   uint256 bounty      = (b * pokeBountyBps) / 10_000;          // 0.1% of P
+//   uint256 paidToPoker = bounty <= surplus ? bounty : surplus;  // capped at what the surplus holds
+//   // pay paidToPoker to the poke caller; sweep (surplus - paidToPoker) to the Developer Pool
 ```
-At payout time in `pokeSettlement`: keep `bountyPool`/`fundBounty()` exactly as they work today for the
-normal case (`min(computedBounty, bountyPool)`), but when `bountyPool` can't cover the full computed amount,
-pull the shortfall on demand from `developerPool` — the same on-demand, capped-at-available pull pattern
-`pullLiquidityBuffer` already used (before its removal above), just repurposed for this instead of deleted
-outright. This draw should be small and rare by construction: it only ever fires when a transaction is small
-enough that even a fair percentage doesn't clear gas cost, or when `bountyPool` itself happens to be
-underfunded (today's actual failure mode, confirmed live: `bountyPool` is currently 0 on Chiado).
+
+**The one real open question — surplus shortfall in a quiet dispute.** The surplus is *not* a fixed 0.1%; it
+is whatever losing trades left behind after winners are paid $1/share (Section 2.6.6). In a contested dispute
+with real counter-trading it is comfortably larger than 0.1% of P. But in a *quiet* dispute — the base case
+where only the two forced initial positions ever trade — the winning side's payout consumes almost the whole
+~1P pool, so the surplus is near zero (whitepaper Section 3.2: the winner "recovers approximately 1P"). There
+`paidToPoker` is capped near zero: little or nothing in the surplus to pay a poker. This is the exact liveness
+case the old gas-floor was invented to protect, reopened by sourcing purely from the surplus. Two coherent
+resolutions, decide before coding:
+  1. **Accept it — rely on the winner self-poking.** In a quiet dispute the winner has their own full payout
+     waiting behind the poke, so they are strongly motivated to call it themselves; the external bounty is
+     redundant there and only matters when the winner is passive. Simplest, and consistent with the "no
+     artificial floor, everything from the market" philosophy — but it makes whitepaper 2.6.8's current claim
+     ("any address, at any time, can *profitably* call pokeSettlement") false for a zero-surplus dispute
+     poked by a non-winner, so that prose would need softening.
+  2. **Keep a minimal floor** drawn from the Developer Pool's accumulated fees (not the per-market surplus)
+     only when the surplus can't cover the bounty — the old gas-floor idea, but funded from the founder's own
+     accrued 0.5% fees rather than a dedicated pool. Preserves 2.6.8's guarantee verbatim, at the cost of the
+     founder occasionally subsidizing a tiny quiet poke.
+
+**Other open questions:**
+- Confirm the intended split: this entry treats "0.5% to founder" (user's words) as the *existing* Developer
+  take (0.5% fee in 2.7 + the rest of the surplus in 2.6.6), NOT a new second 0.5% skim from the surplus. If
+  the user meant a distinct additional 0.5% carved from the surplus alongside the 0.1% poke, revisit here.
+- `pokeBountyBps` wants a sanity check against real gas: 0.1% of a very small P may be below the gas cost of
+  the call itself, which is exactly why resolution (1) leans on the winner's own incentive for tiny quiet
+  disputes. `forge test --gas-report` on `pokeSettlement` against Chiado's actual gas price, not a guess.
+- **Whitepaper sync:** this change makes the Abstract (para 4), Section 2.6.6, and Section 2.6.8 point 5 of
+  v28 stale — they still describe the old "gas-cost floor drawn from the Developer Pool" design. Reconcile
+  them with 0.1%-from-surplus once the shortfall question above is decided (the prose can't be finalized
+  before the mechanism is). Do NOT leave v28 claiming a mechanism the contracts won't implement.
+- **App-side:** `PokeCard.tsx` shows `min(pokeBounty, bountyPool)` today — needs rewriting to show 0.1% of P
+  (and, if resolution (1) is chosen, to explain the bounty may be ~0 in a quiet dispute where the winner is
+  expected to self-poke).
+
+---
+
+## Immutable per-transaction value hardcap (bug blast-radius ceiling)
+
+**Status:** Agreed in principle (2026-07-07 discussion). Whitepaper v28 Section 9 and Section 10 already
+reflect this (they replaced the earlier "deploy only after independent audit" promise); contracts do not
+implement it yet.
+
+**What:** A single immutable ceiling, fixed at deployment in bytecode, on the value any one transaction may
+carry — enforced in the payment path so no transaction for a price P above the cap can settle. Because every
+downstream amount (Locked IB at 1.5P, dispute stakes at 0.5P, market depth at 1P, IB slashing at 1.5P) is a
+multiple of P, capping P caps the total value any single exploited code path can put at risk.
+
+**Why (this is the audit replacement, not a supplement to it):** the user rejects paid audit firms and public
+bug bounties (memory `project_no_paid_audit`). This hardcap is the deliberate substitute: rather than claim a
+bug-freeness no audit can actually establish, bound what any latent bug can *cost*. It is a disclosed,
+deliberately-chosen worst-case exposure ceiling, in the same "bound and disclose the residual risk rather
+than deny it" spirit as the Boundary Theorem (Section 2.6.9).
+
+**Constraints to preserve:**
+- **Immutable, not admin-adjustable.** The cap is a deployment constant, never a settable parameter — a
+  settable cap would be exactly the admin key Section 2.8 forbids. Raising it is done only by deploying a
+  fresh contract at a new address that users consciously adopt (the staged-redeployment path Section 2.8
+  already describes for any logic change). Start low on mainnet, prove it out, redeploy higher.
+- The check belongs in the atomic settlement path — reject at `createListing` (clear seller-side error) AND
+  keep a defensive check at `pay` so the invariant holds even for a listing that predates the cap. Fail
+  closed, before any state that assumes the payment is valid.
 
 **Open questions before implementing:**
-- Exact `pokeBountyBps` and `pokeGasFloor` values need real gas profiling (`forge test --gas-report` on
-  `pokeSettlement`) against this deployment's actual gas price, not a guess.
-- Whether `developerPool` needs a new dedicated function for this pull (e.g. `pullBountyShortfall`) or can
-  reuse a generalized version of the same pull-capped-at-available primitive `pullLiquidityBuffer` used —
-  leaning toward one generalized primitive rather than two near-identical ones, decide at implementation time.
-- Whitepaper v28 Section 2.6.8 point 5 already reflects this design in prose; keep it in sync if the exact
-  mechanism changes during implementation.
-- App-side: `PokeCard.tsx` already shows the real `min(pokeBounty, bountyPool)` payout (fixed 2026-07-07) —
-  needs updating again once the bounty computation itself changes to the percentage+floor formula.
+- The cap value is a launch-time decision, deliberately conservative for a first mainnet deployment, and
+  re-derived (not reused) per deployment — same discipline Section 2.9 already demands for threshold/b.
+- Whether the cap is denominated in the chain's native unit (xDAI) directly, given the protocol has no price
+  oracle by design — leaning yes (native unit, no oracle), consistent with everything else being P-relative.
