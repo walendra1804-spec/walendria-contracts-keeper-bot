@@ -52,7 +52,7 @@ export const settlementConditionsAbi = parseAbi([
   "function tracking(uint256 marketId) view returns (uint256 cumulativeGuilty, uint256 cumulativeInnocent, uint256 lastCheckpointTime, bool trackedSideIsGuilty, bool trackedSideActive, bool initialized)",
   "function pokeSettlement(uint256 marketId)",
   "function CUMULATIVE_DURATION() view returns (uint256)",
-  "function pokeBounty() view returns (uint256)",
+  "function pokeBountyBps() view returns (uint256)",
 ]);
 
 export const disputeManagerAbi = parseAbi([
