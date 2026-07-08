@@ -26,7 +26,7 @@ contract ListingManagerInvariantTest is Test {
 
         address[] memory lmControllers = new address[](1);
         lmControllers[0] = controller;
-        lm = new ListingManager(bond, lmControllers);
+        lm = new ListingManager(bond, lmControllers, type(uint256).max);
         require(address(lm) == predictedLm, "CREATE nonce prediction drifted");
 
         for (uint256 i = 0; i < 3; i++) {

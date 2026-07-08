@@ -16,8 +16,7 @@ contract AdversarialPokeVerifyScript is Script {
     SettlementConditions internal constant settlementConditions =
         SettlementConditions(0x3a1da6BD7a8fa38B0b6b798eA25d25f7C6475f18);
 
-    uint256 internal constant MARKET_ID =
-        22756765779589845761170775236260874230900367805402455632653690919156678150133;
+    uint256 internal constant MARKET_ID = 22756765779589845761170775236260874230900367805402455632653690919156678150133;
 
     function run() external {
         (address poker, uint256 pokerKey) = makeAddrAndKey("adversarial-live-poker");

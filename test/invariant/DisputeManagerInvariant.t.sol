@@ -36,7 +36,7 @@ contract DisputeManagerInvariantTest is Test {
         address[] memory lmControllers = new address[](2);
         lmControllers[0] = settlementStandIn;
         lmControllers[1] = predictedDm;
-        lm = new ListingManager(bond, lmControllers);
+        lm = new ListingManager(bond, lmControllers, type(uint256).max);
         require(address(lm) == predictedLm, "CREATE nonce prediction drifted (lm)");
 
         address[] memory marketControllers = new address[](2);
@@ -45,7 +45,7 @@ contract DisputeManagerInvariantTest is Test {
         market = new SpectralMarket(marketControllers, ISettlementConditionsHook(address(0)), address(0));
         require(address(market) == predictedMarket, "CREATE nonce prediction drifted (market)");
 
-        dm = new DisputeManager(lm, bond, market, DeveloperPool(payable(address(0))));
+        dm = new DisputeManager(lm, bond, market);
         require(address(dm) == predictedDm, "CREATE nonce prediction drifted (dm)");
 
         for (uint256 i = 0; i < 3; i++) {

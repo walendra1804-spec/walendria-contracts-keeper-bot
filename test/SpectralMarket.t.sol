@@ -683,6 +683,65 @@ contract SpectralMarketSurplusTest is Test {
         assertEq(payout, 1 ether, "the winning side's redemption is unaffected by the surplus sweep");
     }
 
+    // ── payResolutionBounty (the 0.1% poke bounty, drawn from the same surplus) ───────────────────────────────
+
+    /// @notice A successful poke's bounty is paid from the same surplus a sweep would otherwise collect: the
+    ///         recipient receives the requested amount when the surplus covers it, and the remainder still sweeps
+    ///         to the Developer Pool. Winners are still made whole 1:1.
+    function test_PayResolutionBountyPaysRequestedFromSurplusThenRestSweeps() public {
+        vm.prank(loser);
+        uint256 cost = market.buy{value: 1 ether}(1, SpectralMarket.Side.Innocent, 0.3 ether);
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        address poker = makeAddr("surplusPoker");
+        uint256 requested = cost / 4; // comfortably below the available surplus
+        uint256 pokerBefore = poker.balance;
+
+        vm.prank(controller);
+        uint256 paid = market.payResolutionBounty(1, poker, requested);
+
+        assertEq(paid, requested, "pays the full request when the surplus covers it");
+        assertEq(poker.balance - pokerBefore, requested);
+
+        uint256 devBefore = developerPool.balance;
+        uint256 swept = market.sweepSurplus(1);
+        assertEq(swept, cost - requested, "the remainder of the surplus still sweeps to the Developer Pool");
+        assertEq(developerPool.balance - devBefore, swept);
+
+        vm.prank(guilty1);
+        assertEq(market.redeem(1), 1 ether, "the winning side is still made whole 1:1");
+    }
+
+    function test_PayResolutionBountyCapsAtAvailableSurplus() public {
+        vm.prank(loser);
+        uint256 cost = market.buy{value: 1 ether}(1, SpectralMarket.Side.Innocent, 0.3 ether);
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        address poker = makeAddr("surplusPoker2");
+        uint256 requested = cost + 1 ether; // far more than the surplus holds
+
+        vm.prank(controller);
+        uint256 paid = market.payResolutionBounty(1, poker, requested);
+
+        assertEq(paid, cost, "capped at the whole available surplus, never more");
+        assertEq(poker.balance, cost);
+
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.NoSurplusToSweep.selector, 1));
+        market.sweepSurplus(1); // nothing left after the bounty took the whole surplus
+    }
+
+    function test_PayResolutionBountyRevertsForNonController() public {
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        address notController = makeAddr("notController");
+        vm.prank(notController);
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.NotController.selector, notController));
+        market.payResolutionBounty(1, notController, 1);
+    }
+
     function test_SweepSurplusEmitsEvent() public {
         vm.prank(loser);
         uint256 cost = market.buy{value: 1 ether}(1, SpectralMarket.Side.Innocent, 0.3 ether);

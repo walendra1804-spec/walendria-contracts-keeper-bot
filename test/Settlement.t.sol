@@ -94,7 +94,7 @@ contract SettlementTest is Test {
 
         address[] memory lmControllers = new address[](1);
         lmControllers[0] = predictedSettlement;
-        lm = new ListingManager(bond, lmControllers);
+        lm = new ListingManager(bond, lmControllers, type(uint256).max);
         assertEq(address(lm), predictedLm, "CREATE nonce prediction drifted (lm)");
 
         settlement = new Settlement(lm, devPool);

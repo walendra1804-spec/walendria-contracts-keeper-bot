@@ -19,7 +19,7 @@ contract SettlementConditionsTest is Test {
     uint256 internal constant P = 1 ether;
     uint256 internal constant B = 1 ether; // b = 1 * P, locked parameter
     uint256 internal constant HALF_P = 0.5 ether;
-    uint256 internal constant POKE_BOUNTY = 0.01 ether;
+    uint256 internal constant POKE_BOUNTY_BPS = 10; // 0.1% of P (whitepaper Section 2.6.8 point 5)
     uint256 internal constant MARKET_ID = 1;
 
     function setUp() public {
@@ -29,7 +29,7 @@ contract SettlementConditionsTest is Test {
         // (Phase 4), via CREATE nonce prediction.
         uint256 nonce = vm.getNonce(address(this));
         address predictedMarket = vm.computeCreateAddress(address(this), nonce + 1);
-        conditions = new SettlementConditions(SpectralMarket(predictedMarket), POKE_BOUNTY);
+        conditions = new SettlementConditions(SpectralMarket(predictedMarket), POKE_BOUNTY_BPS);
 
         // SettlementConditions must itself be a registered controller: pokeSettlement calls
         // spectralMarket.resolveMarket(...) directly, which is onlyController-gated (Section 2.6.8's poke
@@ -78,12 +78,43 @@ contract SettlementConditionsTest is Test {
         arr[0] = v;
     }
 
+    /// @dev Lets this test contract receive the surplus-sourced poke bounty when it calls pokeSettlement itself
+    ///      (unpranked). SpectralMarket.payResolutionBounty pays the caller directly, so a caller with no
+    ///      receive() would otherwise make an unpranked poke revert on the transfer.
+    receive() external payable {}
+
+    /// @dev Deploys a fresh market + conditions pair wired to each other, with a given poke-bounty bps, for tests
+    ///      that need a bps different from the default (e.g. forcing bounty > surplus to exercise the cap).
+    function _deployPair(uint256 bps) internal returns (SpectralMarket m, SettlementConditions c) {
+        uint256 nonce = vm.getNonce(address(this));
+        address predictedMarket = vm.computeCreateAddress(address(this), nonce + 1);
+        c = new SettlementConditions(SpectralMarket(predictedMarket), bps);
+        address[] memory controllers = new address[](2);
+        controllers[0] = controller;
+        controllers[1] = address(c);
+        m = new SpectralMarket(controllers, ISettlementConditionsHook(address(c)), address(0));
+        assertEq(address(m), predictedMarket, "pair CREATE nonce prediction drifted");
+    }
+
+    function _openMarket(SpectralMarket m, uint256 marketId) internal {
+        address[] memory funders = new address[](1);
+        funders[0] = guiltyFunder;
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = HALF_P;
+        vm.prank(controller);
+        m.openMarket{value: P}(marketId, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
+    }
+
     // ── Constructor ────────────────────────────────────────────────────────────────────────────────────────────
 
-    function test_ConstructorSetsImmutablesAndInitialBountyPool() public view {
+    function test_ConstructorSetsImmutables() public view {
         assertEq(address(conditions.spectralMarket()), address(market));
-        assertEq(conditions.pokeBounty(), POKE_BOUNTY);
-        assertEq(conditions.bountyPool(), 0);
+        assertEq(conditions.pokeBountyBps(), POKE_BOUNTY_BPS);
+    }
+
+    function test_ConstructorRevertsOnBpsAboveOneHundredPercent() public {
+        vm.expectRevert(abi.encodeWithSelector(SettlementConditions.InvalidBountyBps.selector, uint256(10_001)));
+        new SettlementConditions(market, 10_001);
     }
 
     // ── Access control ─────────────────────────────────────────────────────────────────────────────────────────
@@ -289,7 +320,9 @@ contract SettlementConditionsTest is Test {
 
         (uint256 cumulativeGuiltyAfterFlip, uint256 cumulativeInnocentAfterFlip,,,,) = conditions.tracking(MARKET_ID);
         assertEq(cumulativeGuiltyAfterFlip, 30 minutes, "Guilty's counter must freeze, not reset or keep accruing");
-        assertEq(cumulativeInnocentAfterFlip, 0, "Innocent must start from zero, never inheriting Guilty's elapsed time");
+        assertEq(
+            cumulativeInnocentAfterFlip, 0, "Innocent must start from zero, never inheriting Guilty's elapsed time"
+        );
 
         (bool resolvedRightAfterFlip,) = _isResolved(MARKET_ID);
         assertFalse(resolvedRightAfterFlip, "flipping sides is not itself a resolution event");
@@ -301,7 +334,8 @@ contract SettlementConditionsTest is Test {
         market.buy{value: 0.01 ether}(MARKET_ID, SpectralMarket.Side.Innocent, 1e9);
         (bool resolvedAt59Min,) = _isResolved(MARKET_ID);
         assertFalse(
-            resolvedAt59Min, "Innocent alone has only accrued 59 minutes; Guilty's frozen 30min must not count toward it"
+            resolvedAt59Min,
+            "Innocent alone has only accrued 59 minutes; Guilty's frozen 30min must not count toward it"
         );
 
         // Just over 1 more minute crosses Innocent's own full, independent hour.
@@ -352,66 +386,56 @@ contract SettlementConditionsTest is Test {
         conditions.pokeSettlement(MARKET_ID);
     }
 
-    function test_PokeSettlementPaysFullBountyToCaller() public {
-        conditions.fundBounty{value: 1 ether}();
-
+    function test_PokeSettlementPaysBountyFromSurplusToCaller() public {
         uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
         vm.prank(buyer);
         market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
         vm.warp(block.timestamp + 1 hours + 1);
+
+        // Guilty wins; at resolution (nothing redeemed yet) surplus = pooled - Guilty-side obligation, guarded
+        // for the under-collateralized case (a lone winning-side buy costs less than its own eventual payout,
+        // Section 2.6.9, so it can leave pooled below the obligation - a real LMSR bounded-loss property).
+        (, SD59x18 qGuilty,, uint256 pooled,,,) = market.markets(MARKET_ID);
+        uint256 obligation = uint256(SD59x18.unwrap(qGuilty));
+        uint256 surplus = pooled > obligation ? pooled - obligation : 0;
+        uint256 bounty = (P * POKE_BOUNTY_BPS) / 10_000;
+        uint256 expectedPaid = bounty < surplus ? bounty : surplus;
 
         address poker = makeAddr("poker");
         uint256 before = poker.balance;
         vm.prank(poker);
         conditions.pokeSettlement(MARKET_ID);
 
-        assertEq(poker.balance - before, POKE_BOUNTY);
-        assertEq(conditions.bountyPool(), 1 ether - POKE_BOUNTY);
-    }
-
-    function test_PokeSettlementPaysPartialBountyWithoutBlockingResolution() public {
-        conditions.fundBounty{value: POKE_BOUNTY / 2}();
-
-        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
-        vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
-        vm.warp(block.timestamp + 1 hours + 1);
-
-        address poker = makeAddr("poker2");
-        uint256 before = poker.balance;
-        vm.prank(poker);
-        conditions.pokeSettlement(MARKET_ID);
-
-        assertEq(poker.balance - before, POKE_BOUNTY / 2, "should pay whatever is available, not revert");
-        assertEq(conditions.bountyPool(), 0);
-        (bool resolved,) = _isResolved(MARKET_ID);
-        assertTrue(resolved, "resolution must not be blocked by insufficient bounty funds");
-    }
-
-    function test_PokeSettlementResolvesWithZeroBountyWhenPoolEmpty() public {
-        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
-        vm.prank(buyer);
-        market.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
-        vm.warp(block.timestamp + 1 hours + 1);
-
-        conditions.pokeSettlement(MARKET_ID); // bountyPool is 0 (never funded) - must still succeed
-
+        assertEq(poker.balance - before, expectedPaid, "poker paid min(0.1% of P, surplus) from the market surplus");
+        assertEq(address(conditions).balance, 0, "SettlementConditions never custodies bounty funds itself");
         (bool resolved,) = _isResolved(MARKET_ID);
         assertTrue(resolved);
     }
 
-    // ── fundBounty ─────────────────────────────────────────────────────────────────────────────────────────────
+    function test_PokeSettlementCapsBountyAtAvailableSurplusWithoutBlockingResolution() public {
+        // A deliberately oversized 100% bps forces bounty > surplus, exercising the cap: the poker receives the
+        // whole surplus (never more), and resolution still succeeds.
+        (SpectralMarket m2, SettlementConditions c2) = _deployPair(10_000); // 100% of P
+        _openMarket(m2, MARKET_ID);
 
-    function test_FundBountyIsPermissionlessAndAccumulates() public {
-        address anyone = makeAddr("anyone");
-        vm.deal(anyone, 5 ether);
+        uint256 sharesToReach94 = _sharesToReachPrice(B, 0.94e18);
+        vm.prank(buyer);
+        m2.buy{value: 10 ether}(MARKET_ID, SpectralMarket.Side.Guilty, sharesToReach94);
+        vm.warp(block.timestamp + 1 hours + 1);
 
-        vm.prank(anyone);
-        conditions.fundBounty{value: 2 ether}();
-        assertEq(conditions.bountyPool(), 2 ether);
+        (, SD59x18 qGuilty,, uint256 pooled,,,) = m2.markets(MARKET_ID);
+        uint256 obligation = uint256(SD59x18.unwrap(qGuilty));
+        uint256 surplus = pooled > obligation ? pooled - obligation : 0;
+        assertGt(P, surplus, "the 100% bps bounty (== P) must exceed surplus so the cap is what pays");
 
-        conditions.fundBounty{value: 1 ether}();
-        assertEq(conditions.bountyPool(), 3 ether);
+        address poker = makeAddr("poker2");
+        uint256 before = poker.balance;
+        vm.prank(poker);
+        c2.pokeSettlement(MARKET_ID);
+
+        assertEq(poker.balance - before, surplus, "capped at the whole available surplus, never more");
+        (,,,,, bool resolved,) = m2.markets(MARKET_ID);
+        assertTrue(resolved, "resolution must not be blocked by the surplus cap");
     }
 
     // ── Multi-market isolation ─────────────────────────────────────────────────────────────────────────────────

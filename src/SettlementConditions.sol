@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {SD59x18} from "prb-math/SD59x18.sol";
 import {SpectralMarket} from "./SpectralMarket.sol";
 import {ISettlementConditionsHook} from "./ISettlementConditionsHook.sol";
 
@@ -46,34 +47,35 @@ contract SettlementConditions is ISettlementConditionsHook, ReentrancyGuard {
     uint256 public constant CUMULATIVE_THRESHOLD = 0.93e18;
     /// @notice Section 2.6.5 (confirmed 2026-07-04): cumulative time above threshold required to resolve.
     uint256 public constant CUMULATIVE_DURATION = 1 hours;
+    uint256 public constant BPS_DENOMINATOR = 10_000;
 
     SpectralMarket public immutable spectralMarket;
-    /// @notice Fixed bounty paid to a successful {pokeSettlement} caller. Not a locked protocol parameter (the
-    ///         spec only says "a small, fixed bounty" without a number, unlike 93%/1 hour), so this is a
-    ///         deployer-configurable immutable rather than a hardcoded constant.
-    uint256 public immutable pokeBounty;
+    /// @notice Poke bounty as a fraction of the transaction price P, in basis points (whitepaper Section 2.6.8
+    ///         point 5: 0.1% => 10). The bounty is paid from the resolved market's own settlement surplus by
+    ///         {SpectralMarket-payResolutionBounty}, capped at whatever surplus exists - there is no pre-funded
+    ///         pool. b == P at market open (Section 2.6.4), so the amount is `b * pokeBountyBps / 10_000`.
+    uint256 public immutable pokeBountyBps;
 
     mapping(uint256 marketId => Tracking) public tracking;
-    uint256 public bountyPool;
 
     event Checkpointed(uint256 indexed marketId, uint256 cumulativeGuilty, uint256 cumulativeInnocent);
     event ResolutionMet(uint256 indexed marketId, bool guiltyWins, uint256 cumulativeTime);
     event Poked(uint256 indexed marketId, address indexed poker, uint256 bountyPaid);
-    event BountyFunded(address indexed funder, uint256 amount);
 
     error NotSpectralMarket(address caller);
     error MarketNotOpen(uint256 marketId);
     error MarketAlreadyResolved(uint256 marketId);
     error ConditionsNotYetMet(uint256 marketId);
-    error BountyTransferFailed(address to, uint256 amount);
+    error InvalidBountyBps(uint256 bps);
 
     /// @param _spectralMarket The single SpectralMarket this instance tracks conditions for. Immutable, like
     ///        every other cross-contract address in this codebase.
-    /// @param _pokeBounty See {pokeBounty}.
-    constructor(SpectralMarket _spectralMarket, uint256 _pokeBounty) payable {
+    /// @param _pokeBountyBps See {pokeBountyBps}. Bounded at or below 100% (10_000 bps) as a sanity guard; the
+    ///        intended value is far smaller (10 = 0.1%), and the market surplus caps the actual payout regardless.
+    constructor(SpectralMarket _spectralMarket, uint256 _pokeBountyBps) {
+        if (_pokeBountyBps > BPS_DENOMINATOR) revert InvalidBountyBps(_pokeBountyBps);
         spectralMarket = _spectralMarket;
-        pokeBounty = _pokeBounty;
-        bountyPool = msg.value;
+        pokeBountyBps = _pokeBountyBps;
     }
 
     modifier onlySpectralMarket() {
@@ -96,10 +98,14 @@ contract SettlementConditions is ISettlementConditionsHook, ReentrancyGuard {
     /// @notice Permissionlessly re-runs the checkpoint against the current block timestamp and resolves
     ///         `marketId` if the accumulated-time threshold has been reached (Section 2.6.8 point 3) - the
     ///         mechanism that guarantees a case can never hang indefinitely even if no further trade ever occurs
-    ///         after crossing 93%. Pays whichever is smaller of {pokeBounty} or the remaining {bountyPool} to the
-    ///         caller; an underfunded bounty pool never blocks the resolution itself, only shrinks the reward.
+    ///         after crossing 93%. On success, pays the caller a bounty of `pokeBountyBps` of the transaction
+    ///         price P (b == P at open, Section 2.6.4), drawn from the resolved market's own settlement surplus
+    ///         and capped at whatever that surplus holds (whitepaper Section 2.6.8 point 5). A quiet dispute
+    ///         leaves ~no surplus, so the bounty there may be ~0 - resolution never depends on it, only on the
+    ///         checkpoint threshold being met; the winner's own incentive to poke for their payout is what
+    ///         guarantees liveness in that case.
     function pokeSettlement(uint256 marketId) external nonReentrant {
-        (,,,, bool open, bool resolved,) = spectralMarket.markets(marketId);
+        (SD59x18 bFixed,,,, bool open, bool resolved,) = spectralMarket.markets(marketId);
         if (!open) revert MarketNotOpen(marketId);
         if (resolved) revert MarketAlreadyResolved(marketId);
 
@@ -109,21 +115,14 @@ contract SettlementConditions is ISettlementConditionsHook, ReentrancyGuard {
 
         spectralMarket.resolveMarket(marketId, guiltyWins ? SpectralMarket.Side.Guilty : SpectralMarket.Side.Innocent);
 
-        uint256 payout = bountyPool < pokeBounty ? bountyPool : pokeBounty;
-        if (payout > 0) {
-            bountyPool -= payout;
-            (bool ok,) = msg.sender.call{value: payout}("");
-            if (!ok) revert BountyTransferFailed(msg.sender, payout);
-        }
+        // b == P at market open (Section 2.6.4). Cast is safe: b is a positive wei-scale liquidity parameter,
+        // set from a native-currency amount unreachably far below type(int256).max.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 price = uint256(SD59x18.unwrap(bFixed));
+        uint256 bounty = (price * pokeBountyBps) / BPS_DENOMINATOR;
+        uint256 paid = spectralMarket.payResolutionBounty(marketId, msg.sender, bounty);
 
-        emit Poked(marketId, msg.sender, payout);
-    }
-
-    /// @notice Permissionlessly tops up the bounty pool (Section 2.6.8 point 5: "from the Developer Pool" -
-    ///         Phase 8 wires DeveloperPool.sol as one caller of this; nothing restricts it to that caller).
-    function fundBounty() external payable {
-        bountyPool += msg.value;
-        emit BountyFunded(msg.sender, msg.value);
+        emit Poked(marketId, msg.sender, paid);
     }
 
     function _checkpoint(uint256 marketId, uint256 priceGuilty, uint256 priceInnocent)

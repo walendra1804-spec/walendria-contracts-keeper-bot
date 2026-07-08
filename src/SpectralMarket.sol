@@ -27,18 +27,20 @@ import {ISettlementConditionsHook} from "./ISettlementConditionsHook.sol";
 ///      because one contract instance holds many markets' funds at once - `address(this).balance` is meaningless
 ///      per-market. LMSR's own well-known bounded-loss property (a market maker can owe up to `b * ln(2)` more in
 ///      redemptions than it collected) means `pooled` is not guaranteed sufficient to cover every redemption in
-///      every adversarial trading sequence; the spec's own backstop for this (Section 2.6.7's Protocol Liquidity
-///      Buffer, funded from the Developer Pool) is wired in Phase 8 via DisputeManager crediting DeveloperPool.sol
-///      as an extra symmetric contributor in {openMarket} - this contract has no special-case logic for it, it is
-///      just another address in the arrays below.
+///      every adversarial trading sequence; the whitepaper discloses this as an inherent, computable property of
+///      the curve (Section 2.6.9's Boundary Theorem, scale-invariant in P) rather than subsidizing it away. A
+///      prior revision topped small disputes up to a fixed depth floor from the Developer Pool; that Protocol
+///      Liquidity Buffer has been retired (whitepaper Section 2.6.7), so initial depth is always exactly the 1P
+///      the two sides fund, at any transaction size, with no address credited that did not itself contribute.
 ///
-///      Phase 8 also generalizes the Innocent side of {openMarket} from a single recipient to arrays, mirroring
-///      the Guilty side: the liquidity buffer needs to credit DeveloperPool.sol on *both* sides simultaneously
-///      (Section 2.6.7's "split exactly 50/50"), which the original single-recipient Innocent side couldn't
-///      express. Phase 8 also adds {sweepSurplus} (Section 2.6.6): the difference between a resolved market's
-///      pooled funds and its remaining winning-side obligation is a constant quantity from the moment of
-///      resolution onward (both shrink by exactly the redeemed amount per {redeem} call), so it can be swept to
-///      the Developer Pool at any time after resolution, by anyone, without waiting for every winner to redeem.
+///      {openMarket}'s Guilty and Innocent sides are both arrays: the Guilty side genuinely needs it (a dispute
+///      may be funded by many backers, Section 2.4), and the Innocent side is kept symmetric for a uniform
+///      injection path even though it now always carries exactly one recipient (the seller). {sweepSurplus}
+///      (Section 2.6.6) sends a resolved market's surplus - pooled funds minus the remaining winning-side
+///      obligation - to the Developer Pool; {payResolutionBounty} draws the 0.1% poke bounty from that same
+///      surplus first (whitepaper Section 2.6.8 point 5). Both are safe to call any time after resolution,
+///      because the surplus is constant from that moment onward (both `pooled` and the obligation shrink by
+///      exactly the redeemed amount per {redeem}).
 contract SpectralMarket is ReentrancyGuard {
     enum Side {
         Guilty,
@@ -92,6 +94,7 @@ contract SpectralMarket is ReentrancyGuard {
     event MarketResolved(uint256 indexed marketId, Side winningSide);
     event Redeemed(uint256 indexed marketId, address indexed trader, uint256 shares, uint256 payout);
     event SurplusSwept(uint256 indexed marketId, uint256 amount);
+    event ResolutionBountyPaid(uint256 indexed marketId, address indexed recipient, uint256 amount);
 
     error NoControllers();
     error NotController(address caller);
@@ -316,31 +319,70 @@ contract SpectralMarket is ReentrancyGuard {
         if (!ok) revert TransferFailed(msg.sender, payout);
     }
 
+    /// @notice Pays up to `requested` of `marketId`'s current surplus (Section 2.6.6) to `recipient` as the 0.1%
+    ///         poke bounty (whitepaper Section 2.6.8 point 5), capped at whatever the surplus actually holds.
+    ///         Controller-gated so only SettlementConditions.sol - which knows who called {pokeSettlement} and
+    ///         computes the 0.1%-of-P amount - can trigger it, in the same transaction it resolves the market.
+    /// @dev Sourced from the same surplus {sweepSurplus} would otherwise send to {developerPool}, drawn first: a
+    ///      quiet dispute (the winner holds ~all of the ~1P pool, whitepaper Section 3.2) leaves almost no
+    ///      surplus, so `paid` is capped near zero - by design (whitepaper Section 2.6.8: resolution there rests
+    ///      on the winner's own incentive to poke for their payout, not on this bounty). Never touches winning-
+    ///      share obligations: the cap is exactly `pooled - remainingObligation`, so every winner is still made
+    ///      whole 1:1. nonReentrant, and effects precede the transfer to `recipient` (an arbitrary poke caller).
+    function payResolutionBounty(uint256 marketId, address recipient, uint256 requested)
+        external
+        onlyController
+        nonReentrant
+        returns (uint256 paid)
+    {
+        Market storage m = markets[marketId];
+        if (!m.resolved) revert MarketNotResolved(marketId);
+
+        uint256 surplus = _currentSurplus(m, marketId);
+        paid = requested < surplus ? requested : surplus;
+        if (paid == 0) return 0;
+
+        m.pooled -= paid;
+        emit ResolutionBountyPaid(marketId, recipient, paid);
+
+        (bool ok,) = recipient.call{value: paid}("");
+        if (!ok) revert TransferFailed(recipient, paid);
+    }
+
     /// @notice Sweeps `marketId`'s surplus (Section 2.6.6) to {developerPool}: the difference between pooled
-    ///         funds and the still-outstanding winning-side obligation. This quantity is constant from the moment
-    ///         of resolution onward - both `pooled` and the remaining obligation shrink by exactly the same
-    ///         amount on every {redeem} call - so it is safe to call at any time after resolution, by anyone,
-    ///         repeatedly (later calls simply find zero surplus once a prior sweep already collected it, or once
-    ///         trading losses fully absorbed by winners leave nothing left over).
+    ///         funds and the still-outstanding winning-side obligation, net of any 0.1% poke bounty already drawn
+    ///         from it by {payResolutionBounty}. This quantity is constant from the moment of resolution onward -
+    ///         both `pooled` and the remaining obligation shrink by exactly the same amount on every {redeem}
+    ///         call - so it is safe to call at any time after resolution, by anyone, repeatedly (later calls
+    ///         simply find zero surplus once a prior sweep already collected it, or once trading losses fully
+    ///         absorbed by winners leave nothing left over).
     function sweepSurplus(uint256 marketId) external nonReentrant returns (uint256 surplus) {
         if (developerPool == address(0)) revert DeveloperPoolNotSet();
         Market storage m = markets[marketId];
         if (!m.resolved) revert MarketNotResolved(marketId);
 
-        SD59x18 winningQtyFixed = m.winningSide == Side.Guilty ? m.qGuilty : m.qInnocent;
-        // casting to 'uint256' is safe because share quantities never go negative (they only ever accumulate
-        // non-negative credits - see {SpectralMarket-distinctHolderCount}'s neighboring invariants).
-        // forge-lint: disable-next-line(unsafe-typecast)
-        uint256 winningQty = uint256(SD59x18.unwrap(winningQtyFixed));
-        uint256 remainingObligation = winningQty - totalRedeemed[marketId];
-        if (m.pooled <= remainingObligation) revert NoSurplusToSweep(marketId);
-        surplus = m.pooled - remainingObligation;
+        surplus = _currentSurplus(m, marketId);
+        if (surplus == 0) revert NoSurplusToSweep(marketId);
 
         m.pooled -= surplus;
         emit SurplusSwept(marketId, surplus);
 
         (bool ok,) = developerPool.call{value: surplus}("");
         if (!ok) revert TransferFailed(developerPool, surplus);
+    }
+
+    /// @dev The surplus available for `marketId` right now: pooled funds minus the still-outstanding winning-side
+    ///      obligation (winning shares issued, less what has already been redeemed). Zero when the winners' claim
+    ///      still meets or exceeds the pool - the common case for a quiet dispute. Shared by {sweepSurplus} and
+    ///      {payResolutionBounty} so both compute the surplus identically.
+    function _currentSurplus(Market storage m, uint256 marketId) internal view returns (uint256) {
+        SD59x18 winningQtyFixed = m.winningSide == Side.Guilty ? m.qGuilty : m.qInnocent;
+        // casting to 'uint256' is safe because share quantities never go negative (they only ever accumulate
+        // non-negative credits - see {SpectralMarket-distinctHolderCount}'s neighboring invariants).
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 winningQty = uint256(SD59x18.unwrap(winningQtyFixed));
+        uint256 remainingObligation = winningQty - totalRedeemed[marketId];
+        return m.pooled > remainingObligation ? m.pooled - remainingObligation : 0;
     }
 
     /// @notice Current marginal Guilty/Innocent price for `marketId` (Section 2.6.4), exposed for
@@ -386,28 +428,17 @@ contract SpectralMarket is ReentrancyGuard {
     }
 
     /// @dev Credits `side` shares to each of `recipients` in proportion to `amounts` (2x, per {openMarket}'s
-    ///      unbiased-50/50-opening identity), marking each as a holder for {distinctHolderCount} - except
-    ///      {developerPool} itself, which is deliberately never marked.
-    ///
-    ///      {developerPool} can only ever appear here via DisputeManager's Section 2.6.7 liquidity-buffer top-up
-    ///      (see its `_buildGuiltyArrays`/`_buildInnocentArrays`), which always credits it the *identical* amount
-    ///      on both Guilty and Innocent in the same joint injection - never afterward, since DeveloperPool.sol
-    ///      exposes no function that calls {buy}/{sell}. Whichever side wins, its winning-side shares redeem for
-    ///      exactly what it contributed and its losing-side shares are worth exactly what it forfeits on that
-    ///      side - net effect is always a wash. Mutual-close's third-party check (DisputeManager's
-    ///      `_requireNoThirdParty`) exists to stop the buyer and seller colluding on a verdict at a third party's
-    ///      expense; a party with no directional stake in the outcome cannot be the victim of that collusion, so
-    ///      counting it as a "third party" would only ever block mutual-close for disputes too small to hit
-    ///      Section 2.6.7's depth floor on their own - not protect anyone. A genuine third-party trader is
-    ///      completely unaffected: it still reaches this function only through {buy}, which calls {_markHolder}
-    ///      directly and is never skipped.
+    ///      unbiased-50/50-opening identity), marking each as a holder for {distinctHolderCount}. Every recipient
+    ///      of an initial joint injection is a genuine funder (the Guilty-side backers, or the seller on the
+    ///      Innocent side) - the Protocol Liquidity Buffer that once credited {developerPool} symmetrically on
+    ///      both sides has been retired (whitepaper Section 2.6.7), so there is no longer any address to exempt
+    ///      from the holder count here. A genuine third-party trader still reaches this contract only through
+    ///      {buy}, which calls {_markHolder} directly.
     function _creditSide(uint256 marketId, Side side, address[] calldata recipients, uint256[] calldata amounts)
         private
     {
         for (uint256 i = 0; i < recipients.length; i++) {
-            if (recipients[i] != developerPool) {
-                _markHolder(marketId, side, recipients[i]);
-            }
+            _markHolder(marketId, side, recipients[i]);
             sharesOf[marketId][side][recipients[i]] += amounts[i] * 2;
         }
     }

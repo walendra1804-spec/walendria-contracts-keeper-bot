@@ -63,13 +63,9 @@ contract AdversarialPathIndependenceScript is Script {
         _runSplitIndependence(sellerKey, buyerKey, splitKeys);
     }
 
-    function _fundActors(
-        address seller,
-        address buyer,
-        address backer1,
-        address backer2,
-        address[] memory splitWallets
-    ) internal {
+    function _fundActors(address seller, address buyer, address backer1, address backer2, address[] memory splitWallets)
+        internal
+    {
         // Each of backer1/backer2/split wallets makes exactly one "threshold-crossing" fundGuiltySide call across
         // the two listings it participates in, which triggers the expensive joint-injection path (_openDispute) -
         // seen to need ~8e12 wei of gas headroom against the pre-flight balance check at this deployment's

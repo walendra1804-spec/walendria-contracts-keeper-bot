@@ -29,7 +29,7 @@ contract ListingManagerTest is Test {
 
         address[] memory lmControllers = new address[](1);
         lmControllers[0] = controller;
-        lm = new ListingManager(bond, lmControllers);
+        lm = new ListingManager(bond, lmControllers, type(uint256).max);
         assertEq(address(lm), predictedLm, "CREATE nonce prediction drifted");
 
         vm.deal(seller, 1000 ether);
@@ -40,6 +40,52 @@ contract ListingManagerTest is Test {
     function _singleton(address a) internal pure returns (address[] memory arr) {
         arr = new address[](1);
         arr[0] = a;
+    }
+
+    /// @dev Deploys a fresh IntegrityBond + ListingManager pair with a finite per-transaction hardcap, wired via
+    ///      CREATE nonce prediction exactly like {setUp}, so the cap can be exercised in isolation.
+    function _deployCappedPair(uint256 cap) internal returns (IntegrityBond cappedBond, ListingManager capped) {
+        uint256 nonce = vm.getNonce(address(this));
+        address predictedLm = vm.computeCreateAddress(address(this), nonce + 1);
+        cappedBond = new IntegrityBond(_singleton(predictedLm));
+        capped = new ListingManager(cappedBond, _singleton(controller), cap);
+        assertEq(address(capped), predictedLm, "capped-pair CREATE nonce prediction drifted");
+    }
+
+    // ── Per-transaction hardcap (whitepaper Section 9) ───────────────────────────────────────────────────────────
+
+    function test_ConstructorRevertsOnZeroCap() public {
+        vm.expectRevert(ListingManager.ZeroCap.selector);
+        new ListingManager(bond, _singleton(controller), 0);
+    }
+
+    function test_MaxTransactionValueGetterReturnsConfiguredCap() public {
+        (, ListingManager capped) = _deployCappedPair(5 ether);
+        assertEq(capped.maxTransactionValue(), 5 ether);
+    }
+
+    function test_CreateListingRevertsWhenPriceExceedsHardcap() public {
+        uint256 cap = 5 ether;
+        (, ListingManager capped) = _deployCappedPair(cap);
+
+        // The cap check fires before any IB is locked, so no funded bond is needed to observe the revert.
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.PriceExceedsCap.selector, cap + 1, cap));
+        capped.createListing(cap + 1, 1, WINDOW);
+    }
+
+    function test_CreateListingSucceedsAtExactlyTheHardcap() public {
+        uint256 cap = 5 ether;
+        (IntegrityBond cappedBond, ListingManager capped) = _deployCappedPair(cap);
+
+        vm.deal(seller, 100 ether);
+        vm.prank(seller);
+        cappedBond.deposit{value: 20 ether}(); // covers 1.5 * cap
+        vm.prank(seller);
+        uint256 listingId = capped.createListing(cap, 1, WINDOW); // exactly at the cap is allowed
+
+        (, uint256 price,,,,,) = capped.listings(listingId);
+        assertEq(price, cap, "a listing priced exactly at the cap must be accepted");
     }
 
     // ── createListing ──────────────────────────────────────────────────────────────────────────────────────────

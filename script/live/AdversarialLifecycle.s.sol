@@ -98,9 +98,7 @@ contract AdversarialLifecycleScript is Script {
         console.log("CONFIRMED LIVE: crossing 93%%+ in one transaction did not resolve the market.");
     }
 
-    function _mutualCloseAndVerify(uint256 sellerKey, uint256 buyerKey, uint256 listingId, uint256 marketId)
-        internal
-    {
+    function _mutualCloseAndVerify(uint256 sellerKey, uint256 buyerKey, uint256 listingId, uint256 marketId) internal {
         vm.startBroadcast(buyerKey);
         disputeManager.mutualClose(listingId, 0, SpectralMarket.Side.Innocent);
         vm.stopBroadcast();

@@ -65,9 +65,8 @@ contract AdversarialInvariantsScript is Script {
     ///         revert is expected regardless of the seller's IB balance at this point.
     function _verifyWindowMinimumEnforced(uint256 sellerKey) internal {
         vm.prank(vm.addr(sellerKey));
-        (bool succeeded,) = address(listingManager).call(
-            abi.encodeWithSelector(ListingManager.createListing.selector, P, 1, COMPLETION_WINDOW - 1 hours)
-        );
+        (bool succeeded,) = address(listingManager)
+            .call(abi.encodeWithSelector(ListingManager.createListing.selector, P, 1, COMPLETION_WINDOW - 1 hours));
         require(!succeeded, "VIOLATION: createListing succeeded with a completion window below the protocol minimum");
         console.log("CONFIRMED LIVE: createListing rejects a completion window below the 72-hour minimum.");
     }
@@ -115,7 +114,9 @@ contract AdversarialInvariantsScript is Script {
     function _verifySellerProceedsAloneCannotReach93Percent(uint256 sellerKey, uint256 marketId) internal {
         uint256 proceeds = (P * 995) / DEV_FEE_BPS_DENOM; // 0.995P, matching Settlement.sol's fee-net forward
         address sellerAddr = vm.addr(sellerKey);
-        require(sellerAddr.balance >= proceeds, "seller did not actually receive sale proceeds - test would be meaningless");
+        require(
+            sellerAddr.balance >= proceeds, "seller did not actually receive sale proceeds - test would be meaningless"
+        );
 
         uint256 affordableShares = _maxSharesForBudget(marketId, SpectralMarket.Side.Guilty, proceeds);
 

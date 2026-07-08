@@ -31,8 +31,8 @@ contract DeployScript is Script {
         address deployer;
         address developer;
         address withdrawalRecipient;
-        uint256 pokeBounty;
-        uint256 initialBountyFunding;
+        uint256 pokeBountyBps;
+        uint256 maxTransactionValue;
     }
 
     struct Predicted {
@@ -48,8 +48,8 @@ contract DeployScript is Script {
 
         vm.startBroadcast();
 
-        (IntegrityBond bond, ListingManager lm) = _deployBondAndListing(predicted);
-        DeveloperPool devPool = _deployDevPool(cfg, predicted);
+        (IntegrityBond bond, ListingManager lm) = _deployBondAndListing(cfg, predicted);
+        DeveloperPool devPool = _deployDevPool(cfg);
         (SettlementConditions conditions, SpectralMarket market) = _deployMarket(cfg, predicted, devPool);
         (Settlement settlement, DisputeManager dm) = _deploySettlementAndDispute(predicted, lm, bond, market, devPool);
         SharedIB sharedIB = _deploySharedIB(cfg.deployer);
@@ -72,8 +72,11 @@ contract DeployScript is Script {
         cfg.deployer = vm.envAddress("DEPLOYER_ADDRESS");
         cfg.developer = vm.envOr("DEVELOPER_ADDRESS", cfg.deployer);
         cfg.withdrawalRecipient = vm.envOr("WITHDRAWAL_RECIPIENT", cfg.deployer);
-        cfg.pokeBounty = vm.envOr("POKE_BOUNTY", uint256(0.001 ether));
-        cfg.initialBountyFunding = vm.envOr("INITIAL_BOUNTY_FUNDING", uint256(0.01 ether));
+        cfg.pokeBountyBps = vm.envOr("POKE_BOUNTY_BPS", uint256(10)); // 0.1% of P (whitepaper Section 2.6.8)
+        // Per-transaction value hardcap (whitepaper Section 9): a bug blast-radius ceiling, NOT a claim about a
+        // "reasonable" transaction size. Deliberately generous for this testnet deployment; re-derive it
+        // conservatively for mainnet (Section 2.9). Raised only by redeploying at a new address (Section 2.8).
+        cfg.maxTransactionValue = vm.envOr("MAX_TRANSACTION_VALUE", uint256(100 ether));
     }
 
     function _predictAddresses(address deployer) internal view returns (Predicted memory p) {
@@ -84,7 +87,10 @@ contract DeployScript is Script {
         p.dm = vm.computeCreateAddress(deployer, nonce + 6);
     }
 
-    function _deployBondAndListing(Predicted memory p) internal returns (IntegrityBond bond, ListingManager lm) {
+    function _deployBondAndListing(DeployConfig memory cfg, Predicted memory p)
+        internal
+        returns (IntegrityBond bond, ListingManager lm)
+    {
         address[] memory bondControllers = new address[](2);
         bondControllers[0] = p.lm;
         bondControllers[1] = p.dm;
@@ -93,23 +99,19 @@ contract DeployScript is Script {
         address[] memory lmControllers = new address[](2);
         lmControllers[0] = p.settlement;
         lmControllers[1] = p.dm;
-        lm = new ListingManager(bond, lmControllers);
+        lm = new ListingManager(bond, lmControllers, cfg.maxTransactionValue);
         require(address(lm) == p.lm, "CREATE nonce prediction drifted (lm)");
     }
 
-    function _deployDevPool(DeployConfig memory cfg, Predicted memory p) internal returns (DeveloperPool devPool) {
-        address[] memory devPoolControllers = new address[](1);
-        devPoolControllers[0] = p.dm;
-        devPool = new DeveloperPool(cfg.developer, cfg.withdrawalRecipient, devPoolControllers);
+    function _deployDevPool(DeployConfig memory cfg) internal returns (DeveloperPool devPool) {
+        devPool = new DeveloperPool(cfg.developer, cfg.withdrawalRecipient);
     }
 
     function _deployMarket(DeployConfig memory cfg, Predicted memory p, DeveloperPool devPool)
         internal
         returns (SettlementConditions conditions, SpectralMarket market)
     {
-        conditions = new SettlementConditions{value: cfg.initialBountyFunding}(
-            SpectralMarket(p.spectralMarket), cfg.pokeBounty
-        );
+        conditions = new SettlementConditions(SpectralMarket(p.spectralMarket), cfg.pokeBountyBps);
 
         address[] memory marketControllers = new address[](2);
         marketControllers[0] = p.dm;
@@ -128,7 +130,7 @@ contract DeployScript is Script {
         settlement = new Settlement(lm, address(devPool));
         require(address(settlement) == p.settlement, "CREATE nonce prediction drifted (settlement)");
 
-        dm = new DisputeManager(lm, bond, market, devPool);
+        dm = new DisputeManager(lm, bond, market);
         require(address(dm) == p.dm, "CREATE nonce prediction drifted (dm)");
     }
 

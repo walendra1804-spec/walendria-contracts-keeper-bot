@@ -69,6 +69,13 @@ contract ListingManager {
 
     IntegrityBond public immutable integrityBond;
 
+    /// @notice Immutable per-transaction value hardcap (whitepaper Section 9): no listing may set a price above
+    ///         this ceiling, which bounds the total value any single transaction - and therefore any single
+    ///         exploited code path - can place at risk. Fixed at deployment; raising it requires a fresh
+    ///         deployment at a new address (Section 2.8), never an admin write. It is not a claim about what a
+    ///         "reasonable" transaction size is - only a blast-radius bound on a bug.
+    uint256 public immutable maxTransactionValue;
+
     mapping(address controller => bool) public isController;
     mapping(uint256 listingId => Listing) public listings;
     mapping(uint256 listingId => mapping(uint256 slotIndex => Slot)) public slots;
@@ -97,6 +104,8 @@ contract ListingManager {
     error ListingNotFound(uint256 listingId);
     error ListingAlreadyClosed(uint256 listingId);
     error ZeroPrice();
+    error ZeroCap();
+    error PriceExceedsCap(uint256 price, uint256 cap);
     error ZeroSlots();
     error TooManySlots(uint256 requested, uint256 max);
     error CompletionWindowTooShort(uint256 requested, uint256 minimum);
@@ -111,9 +120,13 @@ contract ListingManager {
     ///        ListingManager must separately be registered as a controller on that contract.
     /// @param controllers Addresses authorized to call {confirmPayment}/{markDisputed}/{resolveDispute} (e.g.
     ///        Settlement.sol, DisputeManager.sol). Fixed for the lifetime of this contract.
-    constructor(IntegrityBond _integrityBond, address[] memory controllers) {
+    /// @param _maxTransactionValue See {maxTransactionValue}. Must be nonzero (a zero cap would reject every
+    ///        listing); it is a deployment-time blast-radius ceiling, re-derived per deployment (Section 2.9).
+    constructor(IntegrityBond _integrityBond, address[] memory controllers, uint256 _maxTransactionValue) {
         if (controllers.length == 0) revert NoControllers();
+        if (_maxTransactionValue == 0) revert ZeroCap();
         integrityBond = _integrityBond;
+        maxTransactionValue = _maxTransactionValue;
         for (uint256 i = 0; i < controllers.length; i++) {
             isController[controllers[i]] = true;
         }
@@ -132,6 +145,7 @@ contract ListingManager {
         returns (uint256 listingId)
     {
         if (price == 0) revert ZeroPrice();
+        if (price > maxTransactionValue) revert PriceExceedsCap(price, maxTransactionValue);
         if (totalSlots == 0) revert ZeroSlots();
         if (totalSlots > MAX_SLOTS) revert TooManySlots(totalSlots, MAX_SLOTS);
         if (completionWindow < MIN_COMPLETION_WINDOW) {

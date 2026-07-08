@@ -114,19 +114,28 @@ contract AdversarialThirdPartyBlockScript is Script {
         // relayed as a doomed-to-fail transaction, since the property being proven belongs to the contract logic
         // itself and needs no additional confirmation from having actually paid gas to fail.
         vm.prank(vm.addr(buyerKey));
-        (bool buyerSucceeded,) = address(disputeManager).call(
-            abi.encodeWithSelector(DisputeManager.mutualClose.selector, listingId, 0, SpectralMarket.Side.Innocent)
+        (bool buyerSucceeded,) = address(disputeManager)
+            .call(
+                abi.encodeWithSelector(DisputeManager.mutualClose.selector, listingId, 0, SpectralMarket.Side.Innocent)
+            );
+        require(
+            !buyerSucceeded, "VIOLATION: buyer's mutualClose succeeded despite a third party having touched the market"
         );
-        require(!buyerSucceeded, "VIOLATION: buyer's mutualClose succeeded despite a third party having touched the market");
 
         vm.prank(vm.addr(sellerKey));
-        (bool sellerSucceeded,) = address(disputeManager).call(
-            abi.encodeWithSelector(DisputeManager.mutualClose.selector, listingId, 0, SpectralMarket.Side.Innocent)
+        (bool sellerSucceeded,) = address(disputeManager)
+            .call(
+                abi.encodeWithSelector(DisputeManager.mutualClose.selector, listingId, 0, SpectralMarket.Side.Innocent)
+            );
+        require(
+            !sellerSucceeded,
+            "VIOLATION: seller's mutualClose succeeded despite a third party having touched the market"
         );
-        require(!sellerSucceeded, "VIOLATION: seller's mutualClose succeeded despite a third party having touched the market");
 
         (,,,,, bool resolved,) = spectralMarket.markets(marketId);
         require(!resolved, "VIOLATION: market resolved via mutualClose despite third-party participation");
-        console.log("CONFIRMED LIVE: mutualClose stayed permanently blocked after a third party fully exited its position.");
+        console.log(
+            "CONFIRMED LIVE: mutualClose stayed permanently blocked after a third party fully exited its position."
+        );
     }
 }

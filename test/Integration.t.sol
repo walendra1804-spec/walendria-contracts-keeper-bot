@@ -37,7 +37,7 @@ contract IntegrationTest is Test {
     address internal backer = makeAddr("backer");
 
     uint256 internal constant WINDOW = 72 hours;
-    uint256 internal constant POKE_BOUNTY = 0.01 ether;
+    uint256 internal constant POKE_BOUNTY_BPS = 10; // 0.1% of P (whitepaper Section 2.6.8 point 5)
 
     function setUp() public {
         uint256 nonce = vm.getNonce(address(this));
@@ -54,14 +54,12 @@ contract IntegrationTest is Test {
         address[] memory lmControllers = new address[](2);
         lmControllers[0] = predictedSettlement;
         lmControllers[1] = predictedDm;
-        lm = new ListingManager(bond, lmControllers);
+        lm = new ListingManager(bond, lmControllers, type(uint256).max);
         assertEq(address(lm), predictedLm, "CREATE nonce prediction drifted (lm)");
 
-        address[] memory devPoolControllers = new address[](1);
-        devPoolControllers[0] = predictedDm;
-        devPool = new DeveloperPool(developer, withdrawalRecipient, devPoolControllers);
+        devPool = new DeveloperPool(developer, withdrawalRecipient);
 
-        conditions = new SettlementConditions(SpectralMarket(predictedSpectralMarket), POKE_BOUNTY);
+        conditions = new SettlementConditions(SpectralMarket(predictedSpectralMarket), POKE_BOUNTY_BPS);
 
         address[] memory marketControllers = new address[](2);
         marketControllers[0] = predictedDm;
@@ -72,7 +70,7 @@ contract IntegrationTest is Test {
         settlement = new Settlement(lm, address(devPool));
         assertEq(address(settlement), predictedSettlement, "CREATE nonce prediction drifted (settlement)");
 
-        dm = new DisputeManager(lm, bond, market, devPool);
+        dm = new DisputeManager(lm, bond, market);
         assertEq(address(dm), predictedDm, "CREATE nonce prediction drifted (dm)");
 
         vm.deal(seller, 10_000 ether);
@@ -229,8 +227,18 @@ contract IntegrationTest is Test {
         vm.prank(buyer);
         market.buy{value: 100 ether}(marketId, SpectralMarket.Side.Guilty, sharesToReach94);
 
-        conditions.fundBounty{value: POKE_BOUNTY}();
         vm.warp(block.timestamp + 1 hours + 1);
+
+        // Guilty will win; the poke bounty is 0.1% of P, paid from the market surplus and capped at whatever
+        // surplus exists. This scenario's only extra trade is the buyer's own winning-side buy, which by the
+        // Boundary Theorem (Section 2.6.9) costs less than its eventual payout - so it adds no positive surplus,
+        // and the bounty here is legitimately ~0. Resolution via poke must still succeed regardless (whitepaper
+        // Section 2.6.8: liveness rests on the winner's own incentive, not on the bounty being payable).
+        (, SD59x18 qGuiltyAtPoke,, uint256 pooledAtPoke,,,) = market.markets(marketId);
+        uint256 obligation = uint256(SD59x18.unwrap(qGuiltyAtPoke));
+        uint256 surplus = pooledAtPoke > obligation ? pooledAtPoke - obligation : 0;
+        uint256 bounty = (price * POKE_BOUNTY_BPS) / 10_000;
+        uint256 expectedPaid = bounty < surplus ? bounty : surplus;
 
         address poker = makeAddr("poker");
         uint256 pokerBefore = poker.balance;
@@ -239,42 +247,9 @@ contract IntegrationTest is Test {
 
         (,,,,, bool resolved,) = market.markets(marketId);
         assertTrue(resolved, "the cumulative timer should resolve via the poke, with no further trades");
-        assertEq(poker.balance - pokerBefore, POKE_BOUNTY, "poker earns the bounty for the successful call");
+        assertEq(poker.balance - pokerBefore, expectedPaid, "poker earns min(0.1% of P, surplus) from the market");
 
         dm.finalizeDispute(listingId, 0);
-    }
-
-    // ── Scenario: a low-price dispute is topped up by the liquidity buffer, funded by an earlier fee ──────────
-
-    function test_FeeRevenueFundsLiquidityBufferForALaterSmallDispute() public {
-        // An earlier, unrelated honest transaction demonstrates the real fee-routing mechanism landing revenue
-        // in DeveloperPool - then vm.deal tops it up to a level representative of fees *accumulated over many*
-        // such prior transactions (a single sale's 0.5% would take an unrealistically large price to single-
-        // handedly cover a multi-ether buffer top-up).
-        uint256 earlierPrice = 20 ether;
-        vm.prank(seller);
-        bond.deposit{value: 30 ether}();
-        vm.prank(seller);
-        uint256 earlierListingId = lm.createListing(earlierPrice, 1, WINDOW);
-        vm.prank(buyer);
-        settlement.pay{value: earlierPrice}(earlierListingId, 0);
-        assertGt(address(devPool).balance, 0, "the earlier sale's fee must already be sitting in DeveloperPool");
-        vm.deal(address(devPool), 10 ether);
-
-        // A much smaller, later dispute needs the buffer.
-        uint256 smallPrice = 1 ether;
-        uint256 listingId = _paidListing(smallPrice);
-        uint256 marketId = dm.marketIdOf(listingId, 0);
-
-        vm.prank(buyer);
-        dm.fundGuiltySide{value: smallPrice / 2}(listingId, 0);
-
-        (, SD59x18 qGuilty,,,,,) = market.markets(marketId);
-        assertEq(
-            uint256(SD59x18.unwrap(qGuilty)),
-            dm.MIN_LIQUIDITY_DEPTH(),
-            "the fee revenue collected earlier should have topped this dispute up to the $5-equivalent floor"
-        );
     }
 
     // ── Scenario: resolution surplus sweeps to DeveloperPool ──────────────────────────────────────────────────

@@ -2,67 +2,50 @@
 pragma solidity ^0.8.26;
 
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {SpectralMarket} from "./SpectralMarket.sol";
 
 /// @title DeveloperPool
-/// @notice Fee and surplus routing for Walendria Protocol "The 27" (Section 2.6.6, 2.6.7, 2.7): collects the 0.5%
-///         Developer Transaction Fee (forwarded automatically by Settlement.sol) and the Spectral Market's
-///         resolution surplus (swept permissionlessly from SpectralMarket.sol), funds the Section 2.6.7 Protocol
-///         Liquidity Buffer top-up on small-P disputes via a controller-gated pull, and lets the developer
-///         withdraw accumulated balance to a recipient address they may update at any time.
-/// @dev Phase 8 of the build strategy. `receive()` accepts both revenue sources with no special-casing - a plain,
-///      calldata-less transfer is all Settlement.pay (`developerFeeRecipient.call`) and SpectralMarket.sweepSurplus
-///      (`developerPool.call`) ever do, and this contract needs no confirmation of *why* value arrived, only that
-///      it did.
+/// @notice Fee and surplus routing for Walendria Protocol (Section 2.6.6, 2.7): collects the 0.5% Developer
+///         Transaction Fee (forwarded automatically by Settlement.sol) and the Spectral Market's post-resolution
+///         surplus (swept permissionlessly from SpectralMarket.sol, net of the 0.1% poke bounty SpectralMarket
+///         pays the resolver first - see {SpectralMarket-payResolutionBounty}), and lets the developer withdraw
+///         the accumulated balance to a recipient address they may update at any time.
+/// @dev `receive()` accepts both revenue sources with no special-casing - a plain, calldata-less transfer is all
+///      Settlement.pay (`developerFeeRecipient.call`) and SpectralMarket.sweepSurplus (`developerPool.call`) ever
+///      do, and this contract needs no confirmation of *why* value arrived, only that it did.
 ///
 ///      Section 2.8: "The only parameter the developer may update post-deployment is the Developer Pool
-///      withdrawal address." This is modeled precisely: `developer` (the privileged caller) is immutable, fixed
-///      forever at construction; `withdrawalRecipient` (where {withdraw} sends funds) is the one mutable value in
-///      the entire protocol, updatable only by `developer`.
+///      withdrawal address." This is modeled precisely, and it is the single mutable value in the entire protocol:
+///      `developer` (the privileged caller) is immutable, fixed forever at construction; `withdrawalRecipient`
+///      (where {withdraw} sends funds) is updatable only by `developer`. Every other parameter across every
+///      contract is fixed permanently at deployment.
 ///
-///      `withdraw` imposes no reserve/partition between "fee revenue" and "buffer reserve" - the whitepaper
-///      describes both as uses of the same pool, not an on-chain-enforced split, and `developer` is already a
-///      fully trusted role throughout this codebase (the same trust model as every other controller/deployer
-///      relationship here). A developer who drains funds needed for an imminent buffer top-up is a governance/
-///      trust failure, not a contract invariant this code is asked to defend against.
+///      This contract holds no share position and pulls from no other contract: the Protocol Liquidity Buffer
+///      (a prior revision's $5 depth top-up, which was the only path by which this pool ever acquired Spectral
+///      Market shares or lent capital out) has been retired, so the associated `pullLiquidityBuffer`/
+///      `redeemFromMarket`/controller machinery is gone. It is now purely a revenue sink plus a withdrawal.
 contract DeveloperPool is ReentrancyGuard {
     address public immutable developer;
     address public withdrawalRecipient;
-    mapping(address controller => bool) public isController;
 
     event Received(address indexed from, uint256 amount);
     event WithdrawalRecipientUpdated(address indexed newRecipient);
     event Withdrawn(address indexed recipient, uint256 amount);
-    event LiquidityBufferPulled(address indexed controller, uint256 requested, uint256 sent);
 
     error ZeroAddress();
     error NotDeveloper(address caller);
-    error NoControllers();
-    error NotController(address caller);
     error InsufficientBalance(uint256 requested, uint256 available);
     error TransferFailed(address to, uint256 amount);
 
     /// @param _developer The immutable privileged address (Section 2.8) - never updatable, unlike its recipient.
     /// @param _withdrawalRecipient See {withdrawalRecipient}.
-    /// @param controllers Addresses authorized to call {pullLiquidityBuffer} (e.g. DisputeManager.sol). Fixed for
-    ///        the lifetime of this contract, like every other controller allowlist in this codebase.
-    constructor(address _developer, address _withdrawalRecipient, address[] memory controllers) {
+    constructor(address _developer, address _withdrawalRecipient) {
         if (_developer == address(0) || _withdrawalRecipient == address(0)) revert ZeroAddress();
-        if (controllers.length == 0) revert NoControllers();
         developer = _developer;
         withdrawalRecipient = _withdrawalRecipient;
-        for (uint256 i = 0; i < controllers.length; i++) {
-            isController[controllers[i]] = true;
-        }
     }
 
     modifier onlyDeveloper() {
         if (msg.sender != developer) revert NotDeveloper(msg.sender);
-        _;
-    }
-
-    modifier onlyController() {
-        if (!isController[msg.sender]) revert NotController(msg.sender);
         _;
     }
 
@@ -80,36 +63,6 @@ contract DeveloperPool is ReentrancyGuard {
         emit Withdrawn(withdrawalRecipient, amount);
         (bool ok,) = withdrawalRecipient.call{value: amount}("");
         if (!ok) revert TransferFailed(withdrawalRecipient, amount);
-    }
-
-    /// @notice Funds the Section 2.6.7 Protocol Liquidity Buffer top-up: sends `min(amount, available balance)`
-    ///         to the calling controller (DisputeManager.sol), returning the actual amount sent. Capping rather
-    ///         than reverting on an underfunded pool mirrors SettlementConditions' poke-bounty degradation - an
-    ///         insufficiently-funded buffer shrinks the top-up, it never blocks a dispute from opening.
-    function pullLiquidityBuffer(uint256 amount) external onlyController nonReentrant returns (uint256 sent) {
-        uint256 available = address(this).balance;
-        sent = amount > available ? available : amount;
-        emit LiquidityBufferPulled(msg.sender, amount, sent);
-        if (sent == 0) return 0;
-        (bool ok,) = msg.sender.call{value: sent}("");
-        if (!ok) revert TransferFailed(msg.sender, sent);
-    }
-
-    /// @notice Permissionlessly redeems this contract's own winning-side shares (if any) in `marketId` on
-    ///         `market`. The Section 2.6.7 liquidity-buffer top-up credits this contract identically on both
-    ///         sides of a joint injection (see {SpectralMarket-_creditSide}), so only the winning side is ever
-    ///         redeemable - this contract itself never trades, so that is the only source it could ever hold
-    ///         shares from.
-    /// @dev A no-op, not a revert, when nothing is owed: the overwhelming majority of disputes never needed a
-    ///      top-up at all, and {SpectralMarket-redeem} reverts on a zero balance. Swallowing that (or any other)
-    ///      revert via try/catch lets DisputeManager.sol call this unconditionally as part of every dispute's
-    ///      finalization, without first checking whether this contract has anything to claim.
-    function redeemFromMarket(SpectralMarket market, uint256 marketId) external nonReentrant returns (uint256 payout) {
-        try market.redeem(marketId) returns (uint256 p) {
-            payout = p;
-        } catch {
-            payout = 0;
-        }
     }
 
     /// @notice Accepts the Developer Fee (Settlement.sol) and resolution surplus (SpectralMarket.sol) - both

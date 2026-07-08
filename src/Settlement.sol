@@ -38,6 +38,7 @@ contract Settlement is ReentrancyGuard {
 
     error ZeroAddress();
     error InsufficientPayment(uint256 sent, uint256 required);
+    error PriceExceedsCap(uint256 price, uint256 cap);
     error RefundFailed(address buyer, uint256 amount);
     error FeeTransferFailed(address recipient, uint256 amount);
     error ProceedsTransferFailed(address seller, uint256 amount);
@@ -66,6 +67,13 @@ contract Settlement is ReentrancyGuard {
     function pay(uint256 listingId, uint256 slotIndex) external payable nonReentrant {
         (address seller, uint256 price,,,,,) = listingManager.listings(listingId);
         if (msg.value < price) revert InsufficientPayment(msg.value, price);
+
+        // Defensive re-check of the immutable per-transaction hardcap (whitepaper Section 9). ListingManager
+        // already rejects any listing whose price exceeds the cap at creation, so this can only ever fire if
+        // that invariant were violated upstream - a belt-and-suspenders bound in the payment path itself, failing
+        // closed before any value moves.
+        uint256 cap = listingManager.maxTransactionValue();
+        if (price > cap) revert PriceExceedsCap(price, cap);
 
         uint256 fee = (price * DEVELOPER_FEE_BPS) / BPS_DENOMINATOR;
         uint256 proceeds = price - fee;
