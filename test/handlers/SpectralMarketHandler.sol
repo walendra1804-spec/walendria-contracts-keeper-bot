@@ -107,12 +107,21 @@ contract SpectralMarketHandler is Test {
         if (!resolved) return;
 
         address trader = traders[traderSeed % traders.length];
+        // Captured *before* calling redeem(): the invariant tracks share conservation (every share is either
+        // still held or has been extinguished via redeem), which is unaffected by {SpectralMarket-redeem}'s
+        // payout being capped at the pool's balance - that capping is a money-ledger concern (`pooled`), not a
+        // share-ledger one. Using the actual `payout` return value here would under-count redeemedGuilty/
+        // redeemedInnocent by exactly any shortfall, since a capped redemption still fully extinguishes the
+        // trader's shares regardless of how much native currency it actually paid out.
+        uint256 shares = market.sharesOf(marketId, winningSide, trader);
+        if (shares == 0) return;
+
         vm.prank(trader);
-        try market.redeem(marketId) returns (uint256 payout) {
+        try market.redeem(marketId) {
             if (winningSide == SpectralMarket.Side.Guilty) {
-                redeemedGuilty[marketId] += payout;
+                redeemedGuilty[marketId] += shares;
             } else {
-                redeemedInnocent[marketId] += payout;
+                redeemedInnocent[marketId] += shares;
             }
         } catch {}
     }

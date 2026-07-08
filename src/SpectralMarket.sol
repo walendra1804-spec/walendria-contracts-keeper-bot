@@ -10,8 +10,8 @@ import {ISettlementConditionsHook} from "./ISettlementConditionsHook.sol";
 /// @notice The Spectral Market for Walendria Protocol "The 27" (Section 2.6): a purpose-built LMSR prediction
 ///         market, one instance per dispute, keyed by `marketId`. Each market is opened with a joint initial
 ///         position injection (Section 2.6.1), then trades freely (Section 2.6.3) until an authorized controller
-///         resolves it, after which winning-side shares redeem 1:1 for native currency (Section 2.6.3: "every
-///         winning share pays exactly $1.00").
+///         resolves it, after which winning-side shares redeem for up to $1 each (Section 2.6.3), capped at
+///         whatever the market's pool still holds - see {redeem}'s own doc for why a cap rather than a revert.
 /// @dev Phase 5 of the build strategy. Depends only on LMSRMath (Phase 1). Deliberately does not decide *when* a
 ///      market resolves (Section 2.6.5/2.6.8, condition tracking and checkpoint-and-poke) or *when* a dispute's
 ///      cumulative Guilty-side funding has crossed 0.5P (Section 2.4) - those are SettlementConditions.sol (Phase
@@ -293,8 +293,14 @@ contract SpectralMarket is ReentrancyGuard {
         emit MarketResolved(marketId, winningSide);
     }
 
-    /// @notice Redeems the caller's entire winning-side balance in `marketId` for native currency, 1:1 (Section
-    ///         2.6.3: "every winning share pays exactly $1.00").
+    /// @notice Redeems the caller's entire winning-side balance in `marketId` for native currency, up to $1 per
+    ///         share (Section 2.6.3), capped at whatever `pooled` currently holds. LMSR's bounded-loss property
+    ///         (Section 2.6.9) means a heavily-traded market can leave `pooled` short of the full winning-side
+    ///         obligation - the trader who redeems after the pool runs dry receives whatever remains, however
+    ///         little, rather than a hard revert that would leave their entire claim permanently unredeemable
+    ///         (an arithmetic-underflow revert on `m.pooled -= payout` gives that trader literally nothing, in
+    ///         a contract with no mechanism to ever top the pool back up after resolution). A partial, final
+    ///         payout is strictly better for that trader than a claim stuck behind a revert forever.
     /// @dev Deliberately does not touch `m.qGuilty`/`m.qInnocent`: those exist to price trades (Section 2.6.4),
     ///      and {buy}/{sell} already refuse to run once `m.resolved` is true, so they have nothing left to price
     ///      - they are frozen historical state as of resolution, not a live pool that redemptions draw down. The
@@ -309,14 +315,16 @@ contract SpectralMarket is ReentrancyGuard {
         if (shares == 0) revert NothingToRedeem(msg.sender);
 
         sharesOf[marketId][m.winningSide][msg.sender] = 0;
-        payout = shares;
+        payout = shares < m.pooled ? shares : m.pooled;
         m.pooled -= payout;
         totalRedeemed[marketId] += payout;
 
         emit Redeemed(marketId, msg.sender, shares, payout);
 
-        (bool ok,) = msg.sender.call{value: payout}("");
-        if (!ok) revert TransferFailed(msg.sender, payout);
+        if (payout > 0) {
+            (bool ok,) = msg.sender.call{value: payout}("");
+            if (!ok) revert TransferFailed(msg.sender, payout);
+        }
     }
 
     /// @notice Pays up to `requested` of `marketId`'s current surplus (Section 2.6.6) to `recipient` as the 0.1%

@@ -494,6 +494,90 @@ contract SpectralMarketTest is Test {
         market.redeem(2);
     }
 
+    /// @notice LMSR's bounded-loss property (Section 2.6.9) means a heavily-traded winning side can leave the
+    ///         pool short of the full winning-side obligation - the exact scenario a live Chiado dispute hit (a
+    ///         large post-open Guilty buy near price 1, whose cost fell short of the shares it was credited by
+    ///         close to b*ln(2)). Whoever redeems after the pool runs dry must be paid whatever remains, not
+    ///         reverted to zero: nothing in this contract ever tops the pool back up after resolution, so a
+    ///         revert here would strand that trader's entire claim permanently.
+    function test_RedeemCapsPayoutWhenPoolIsShortOfTheFullWinningObligation() public {
+        _openSimpleMarket(1);
+
+        address bigBuyer = makeAddr("bigBuyer");
+        vm.deal(bigBuyer, 1000 ether);
+        vm.prank(bigBuyer);
+        market.buy{value: 1000 ether}(1, SpectralMarket.Side.Guilty, 50 ether);
+
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        uint256 guilty1Shares = market.sharesOf(1, SpectralMarket.Side.Guilty, guilty1);
+        uint256 bigBuyerShares = market.sharesOf(1, SpectralMarket.Side.Guilty, bigBuyer);
+        assertLt(
+            address(market).balance,
+            guilty1Shares + bigBuyerShares,
+            "the pool must be under-collateralized for this test to be meaningful"
+        );
+
+        vm.prank(guilty1);
+        uint256 guilty1Payout = market.redeem(1);
+        assertEq(guilty1Payout, guilty1Shares, "the pool still covers the earlier, smaller claim in full");
+
+        uint256 poolBeforeLastRedeem = address(market).balance;
+        assertLt(
+            poolBeforeLastRedeem,
+            bigBuyerShares,
+            "the pool must be short of the last claim for this test to be meaningful"
+        );
+
+        vm.expectEmit(true, true, true, true, address(market));
+        emit SpectralMarket.Redeemed(1, bigBuyer, bigBuyerShares, poolBeforeLastRedeem);
+        vm.prank(bigBuyer);
+        uint256 bigBuyerPayout = market.redeem(1);
+
+        assertEq(bigBuyerPayout, poolBeforeLastRedeem, "capped at whatever the pool held, never reverted to zero");
+        assertEq(address(market).balance, 0, "the pool is fully drained, not stuck holding unredeemable dust");
+        assertEq(market.sharesOf(1, SpectralMarket.Side.Guilty, bigBuyer), 0, "the claim is extinguished either way");
+    }
+
+    /// @notice Once the pool is already fully drained, a later holder's still-nonzero claim must resolve to a
+    ///         clean zero payout - not revert, and not silently leave their shares un-zeroed for a retry that
+    ///         could never succeed anyway (this contract never tops the pool back up after resolution).
+    function test_RedeemPaysZeroWithoutRevertingWhenPoolIsAlreadyDrained() public {
+        address tinyHolder = makeAddr("tinyHolder");
+        address[] memory funders = new address[](2);
+        funders[0] = guilty1;
+        funders[1] = tinyHolder;
+        uint256[] memory amounts = new uint256[](2);
+        amounts[0] = 0.45 ether;
+        amounts[1] = 0.05 ether;
+        vm.prank(controller);
+        market.openMarket{value: P}(1, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
+
+        address bigBuyer = makeAddr("bigBuyer2");
+        vm.deal(bigBuyer, 1000 ether);
+        vm.prank(bigBuyer);
+        market.buy{value: 1000 ether}(1, SpectralMarket.Side.Guilty, 50 ether);
+
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        vm.prank(guilty1);
+        market.redeem(1);
+        vm.prank(bigBuyer);
+        market.redeem(1);
+        assertEq(address(market).balance, 0, "the pool must already be fully drained for this test to be meaningful");
+
+        uint256 tinyShares = market.sharesOf(1, SpectralMarket.Side.Guilty, tinyHolder);
+        assertGt(tinyShares, 0, "tinyHolder must still hold a genuine, unredeemed claim");
+
+        vm.prank(tinyHolder);
+        uint256 tinyPayout = market.redeem(1);
+
+        assertEq(tinyPayout, 0, "nothing left in the pool to pay");
+        assertEq(market.sharesOf(1, SpectralMarket.Side.Guilty, tinyHolder), 0, "the claim is still extinguished");
+    }
+
     // ── Adversarial ────────────────────────────────────────────────────────────────────────────────────────────
 
     function test_ReentrantTraderCannotDoubleRedeemDuringPayout() public {
