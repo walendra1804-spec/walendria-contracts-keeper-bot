@@ -293,6 +293,164 @@ contract ListingManagerTest is Test {
         lm.finalizeExpiredSlot(listingId, 0);
     }
 
+    // ── confirmCompletion (buyer early release) ──────────────────────────────────────────────────────────────────
+
+    event SlotCompleted(uint256 indexed listingId, uint256 indexed slotIndex, address indexed buyer);
+
+    function test_ConfirmCompletionReleasesIBEarlyAndMarksSlotRemoved() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+        assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED); // locked while confirmed
+
+        // Well before the completion window would ever expire, the buyer confirms receipt.
+        vm.expectEmit(true, true, true, true);
+        emit SlotCompleted(listingId, 0, buyer);
+        vm.prank(buyer);
+        lm.confirmCompletion(listingId, 0);
+
+        (ListingManager.SlotStatus status, uint256 deadline, address recordedBuyer) = lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed)); // spent, not recycled to Empty
+        assertEq(deadline, 0);
+        assertEq(recordedBuyer, buyer, "buyer of record is not erased by completion");
+        assertEq(bond.freeIB(seller), 100 ether); // fully released early, without waiting the window out
+    }
+
+    function test_ConfirmCompletionRevertsWhenCallerIsNotTheBuyer() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+
+        // Neither the seller nor a stranger can release on the buyer's behalf - the window is the buyer's to waive.
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.NotBuyer.selector, seller, buyer));
+        lm.confirmCompletion(listingId, 0);
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.NotBuyer.selector, stranger, buyer));
+        lm.confirmCompletion(listingId, 0);
+
+        assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED); // still locked; nothing moved
+    }
+
+    function test_ConfirmCompletionRevertsOnEmptySlot() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        // An unpaid slot has no buyer of record; wrong-status is reported before the buyer check.
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotPaymentConfirmed.selector, listingId, 0));
+        lm.confirmCompletion(listingId, 0);
+    }
+
+    function test_ConfirmCompletionRevertsOnDisputedSlot() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.startPrank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+        lm.markDisputed(listingId, 0);
+        vm.stopPrank();
+
+        // Once a dispute is open the outcome is the market's, not the buyer's to unilaterally close.
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotPaymentConfirmed.selector, listingId, 0));
+        lm.confirmCompletion(listingId, 0);
+    }
+
+    function test_ConfirmCompletionIsIdempotentlyRejectedAfterItSucceeds() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+
+        vm.prank(buyer);
+        lm.confirmCompletion(listingId, 0);
+
+        // Slot is Removed now; a second confirm (or a window-expiry finalize) must revert - the IB is already free.
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotPaymentConfirmed.selector, listingId, 0));
+        lm.confirmCompletion(listingId, 0);
+
+        vm.warp(block.timestamp + WINDOW);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotPaymentConfirmed.selector, listingId, 0));
+        lm.finalizeExpiredSlot(listingId, 0);
+    }
+
+    function test_ConfirmedThenCompletedSlotCanNoLongerBeDisputed() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+
+        vm.prank(buyer);
+        lm.confirmCompletion(listingId, 0);
+
+        // A controller (DisputeManager) can no longer open a dispute on a slot the buyer already signed off.
+        vm.prank(controller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotPaymentConfirmed.selector, listingId, 0));
+        lm.markDisputed(listingId, 0);
+    }
+
+    function test_ConfirmCompletionRevertsOnOutOfRangeSlot() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotIndexOutOfRange.selector, 1, 1));
+        lm.confirmCompletion(listingId, 1);
+    }
+
+    function test_ConfirmCompletionRevertsOnUnknownListing() public {
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.ListingNotFound.selector, 42));
+        lm.confirmCompletion(42, 0);
+    }
+
+    /// @notice Completion is per-slot and per-buyer: one buyer confirming their own slot must never release,
+    ///         touch, or expose any other slot on the same listing (including another buyer's).
+    function testFuzz_ConfirmCompletionReleasesExactlyOneSlotsWorthAndOnlyTheCallersOwn(
+        uint256 totalSlots,
+        uint256 confirmCount,
+        uint256 completeIndex
+    ) public {
+        totalSlots = bound(totalSlots, 2, 50);
+        confirmCount = bound(confirmCount, 2, totalSlots);
+        completeIndex = bound(completeIndex, 0, confirmCount - 1);
+
+        address otherBuyer = makeAddr("otherBuyer");
+
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, totalSlots, WINDOW);
+        vm.startPrank(controller);
+        for (uint256 i = 0; i < confirmCount; i++) {
+            // Give the target slot to `buyer`; every other confirmed slot to a different buyer.
+            lm.confirmPayment(listingId, i, i == completeIndex ? buyer : otherBuyer);
+        }
+        vm.stopPrank();
+
+        uint256 freeBefore = bond.freeIB(seller);
+
+        // A stranger still cannot complete the target slot, even amid many confirmed slots.
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.NotBuyer.selector, stranger, buyer));
+        lm.confirmCompletion(listingId, completeIndex);
+
+        vm.prank(buyer);
+        lm.confirmCompletion(listingId, completeIndex);
+
+        assertEq(bond.freeIB(seller), freeBefore + PER_SLOT_LOCKED, "exactly one slot's IB released");
+
+        (ListingManager.SlotStatus target,,) = lm.slots(listingId, completeIndex);
+        assertEq(uint8(target), uint8(ListingManager.SlotStatus.Removed));
+
+        // Every other confirmed slot is untouched - still PaymentConfirmed, still locked.
+        for (uint256 i = 0; i < confirmCount; i++) {
+            if (i == completeIndex) continue;
+            (ListingManager.SlotStatus s,,) = lm.slots(listingId, i);
+            assertEq(uint8(s), uint8(ListingManager.SlotStatus.PaymentConfirmed));
+        }
+    }
+
     // ── markDisputed / resolveDispute ──────────────────────────────────────────────────────────────────────────
 
     function test_MarkDisputedRevertsWhenNotController() public {

@@ -11,7 +11,8 @@ import {IntegrityBond} from "./IntegrityBond.sol";
 ///         window (a seller-configurable duration, floored at a 72-hour protocol minimum), after which it
 ///         finalizes and releases its share of Locked IB if no dispute ever opened against it.
 /// @dev Each slot is single-use: once payment confirms, that slot moves forward (PaymentConfirmed -> Disputed ->
-///      Removed, or PaymentConfirmed -> Removed via window expiry) and never returns to Empty. A slot's Locked
+///      Removed, or PaymentConfirmed -> Removed via window expiry or the buyer confirming completion early) and
+///      never returns to Empty. A slot's Locked
 ///      IB is only ever genuinely backed while the *listing* holds it from creation onward; recycling a "spent"
 ///      slot back to Empty without re-locking would let a future buyer transact against a slot with nothing
 ///      actually bonded behind it. A seller wanting more concurrent capacity after slots are spent creates a
@@ -93,6 +94,7 @@ contract ListingManager {
         uint256 indexed listingId, uint256 indexed slotIndex, address indexed buyer, uint256 completionDeadline
     );
     event SlotFinalized(uint256 indexed listingId, uint256 indexed slotIndex);
+    event SlotCompleted(uint256 indexed listingId, uint256 indexed slotIndex, address indexed buyer);
     event SlotDisputed(uint256 indexed listingId, uint256 indexed slotIndex);
     event SlotResolved(uint256 indexed listingId, uint256 indexed slotIndex);
     event SlotsReduced(uint256 indexed listingId, uint256 count);
@@ -101,6 +103,7 @@ contract ListingManager {
     error NoControllers();
     error NotController(address caller);
     error NotSeller(address caller, address seller);
+    error NotBuyer(address caller, address buyer);
     error ListingNotFound(uint256 listingId);
     error ListingAlreadyClosed(uint256 listingId);
     error ZeroPrice();
@@ -216,6 +219,33 @@ contract ListingManager {
         integrityBond.unlock(listing.seller, listing.perSlotLocked);
 
         emit SlotFinalized(listingId, slotIndex);
+    }
+
+    /// @notice Lets a slot's recorded buyer finalize it early - before its completion window has elapsed -
+    ///         releasing the seller's Locked IB back to Free IB immediately (Section 2.5, buyer-side extension).
+    ///         The completion window is the buyer's protection: the interval in which they may open a dispute.
+    ///         This function is the buyer voluntarily waiving the *remainder* of that window once they are
+    ///         satisfied, so the seller's capital is freed without waiting the window out. Only the buyer of
+    ///         record may call it, and only while the slot is still PaymentConfirmed.
+    ///
+    ///         Like {finalizeExpiredSlot}, the slot goes to Removed rather than back to Empty (its capital has
+    ///         been released, so nothing backs it any more), and confirming completion permanently gives up the
+    ///         right to dispute this slot: {markDisputed} requires PaymentConfirmed, which this call moves past.
+    ///         A buyer who has NOT received what they paid for must open a dispute instead of confirming - this
+    ///         is the satisfied-path counterpart to that, never a substitute for it.
+    function confirmCompletion(uint256 listingId, uint256 slotIndex) external {
+        Listing storage listing = _requireListing(listingId);
+        if (slotIndex >= listing.totalSlots) revert SlotIndexOutOfRange(slotIndex, listing.totalSlots);
+
+        Slot storage slot = slots[listingId][slotIndex];
+        if (slot.status != SlotStatus.PaymentConfirmed) revert SlotNotPaymentConfirmed(listingId, slotIndex);
+        if (msg.sender != slot.buyer) revert NotBuyer(msg.sender, slot.buyer);
+
+        slot.status = SlotStatus.Removed;
+        slot.completionDeadline = 0;
+        integrityBond.unlock(listing.seller, listing.perSlotLocked);
+
+        emit SlotCompleted(listingId, slotIndex, msg.sender);
     }
 
     /// @notice Freezes `slotIndex` against window-expiry finalization once a dispute has opened against it
