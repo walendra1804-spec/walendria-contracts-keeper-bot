@@ -27,14 +27,14 @@ export const INDEX_CHUNK_SIZE = process.env.INDEX_CHUNK_SIZE ? BigInt(process.en
 
 export const HTTP_PORT = process.env.HTTP_PORT ? Number(process.env.HTTP_PORT) : 4000;
 
-export const DEPLOYMENT_BLOCK = 21961682n;
+export const DEPLOYMENT_BLOCK = 21986449n;
 
 export const ADDRESSES = {
-  listingManager: "0xebcf83a08fad5d571e7aa1c5e5864592e9fb532f",
-  spectralMarket: "0x9bf0c2e07af4b8e5c857593867da3a6b00062b7b",
-  settlementConditions: "0x3a1da6bd7a8fa38b0b6b798ea25d25f7c6475f18",
-  disputeManager: "0x317dc0607f67378509961b1763179050af48f0ba",
-  evidenceRegistry: "0xc755d28d8c6bc4e456c618c5a532de13d9f7abf3",
+  listingManager: "0xd7082ae2abce68a9db5a22a6489afe1fbac50111",
+  spectralMarket: "0xf2facf7443e506bde3987395a87b9dec8748027a",
+  settlementConditions: "0x36f49e11858de2834f360473009be80e55160ccb",
+  disputeManager: "0x6c5a731167f1b44cd0822d07a002b492bfb57e07",
+  evidenceRegistry: "0x244f9449213a330328adb4dd2f345cbaf478ee1d",
 };
 
 export const listingManagerAbi = parseAbi([
