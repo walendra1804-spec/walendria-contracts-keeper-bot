@@ -142,7 +142,8 @@ contract DisputeManagerTest is Test {
     }
 
     function _marketId(uint256 listingId, uint256 slotIndex) internal view returns (uint256) {
-        return dm.marketIdOf(listingId, slotIndex);
+        (,,, uint256 cycle) = lm.slots(listingId, slotIndex);
+        return dm.marketIdOf(listingId, slotIndex, cycle);
     }
 
     /// @dev Binary-searches the largest `shares` of `side` in `marketId` whose LMSRMath cost does not exceed
@@ -222,7 +223,7 @@ contract DisputeManagerTest is Test {
         assertEq(total, 100 ether - HALF_PRICE);
         assertEq(locked, PER_SLOT_LOCKED - HALF_PRICE, "only the drawn half should be released from locked");
 
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Disputed));
     }
 
@@ -288,7 +289,7 @@ contract DisputeManagerTest is Test {
 
     function test_FundGuiltySideRevertsAfterWindowExpired() public {
         uint256 listingId = _openConfirmedListing();
-        (, uint256 deadline,) = lm.slots(listingId, 0);
+        (, uint256 deadline,,) = lm.slots(listingId, 0);
 
         vm.warp(deadline);
         vm.prank(buyer);
@@ -302,7 +303,7 @@ contract DisputeManagerTest is Test {
     function test_FundGuiltySideOneSecondBeforeExpiryStillSucceeds() public {
         uint256 listingId = _openConfirmedListing();
         uint256 marketId = _marketId(listingId, 0);
-        (, uint256 deadline,) = lm.slots(listingId, 0);
+        (, uint256 deadline,,) = lm.slots(listingId, 0);
 
         vm.warp(deadline - 1);
         vm.prank(buyer);
@@ -458,7 +459,7 @@ contract DisputeManagerTest is Test {
         assertTrue(resolved);
         assertEq(uint8(winningSide), uint8(SpectralMarket.Side.Innocent));
 
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed), "should self-finalize in the same call");
         (uint256 total, uint256 locked) = bond.bonds(seller);
         assertEq(total, 100 ether - HALF_PRICE, "Innocent verdict: only the earlier draw is gone, rest unlocked");
@@ -678,8 +679,8 @@ contract DisputeManagerTest is Test {
         assertEq(locked, 0);
         assertEq(bond.claimable(buyer), REMAINING_LOCKED, "restitution goes to the buyer of record, not the poker");
 
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
-        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed), "Guilty verdict permanently spends it");
 
         uint256 buyerBefore = buyer.balance;
         vm.prank(buyer);
@@ -701,7 +702,7 @@ contract DisputeManagerTest is Test {
         assertEq(bond.freeIB(seller), 100 ether - HALF_PRICE);
         assertEq(bond.claimable(buyer), 0);
 
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
     }
 
@@ -790,7 +791,7 @@ contract DisputeManagerTest is Test {
         market.resolveMarket(marketId, SpectralMarket.Side.Innocent);
         dm.finalizeDispute(listingId, 0); // must not revert despite the seller's reverting receive()
 
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
     }
 
@@ -811,8 +812,47 @@ contract DisputeManagerTest is Test {
         // pull-payment credit, not a push
 
         assertEq(bond.claimable(address(badBuyer)), REMAINING_LOCKED);
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
-        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed), "Guilty verdict permanently spends it");
+    }
+
+    // ── Slot reuse: marketId must never collide across cycles ────────────────────────────────────────────────
+
+    /// @notice A slot's first sale can complete perfectly cleanly (no dispute ever opens) and recycle back to
+    ///         Empty for resale (ListingManager's slot-reuse design). If that slot's *second* sale is the one
+    ///         that ends up disputed, its marketId must be entirely distinct from whatever marketId a dispute
+    ///         against the first sale would have used - even though no such dispute ever actually existed. This
+    ///         is the concrete regression for why {DisputeManager-marketIdOf} folds in ListingManager's per-slot
+    ///         `cycle` counter rather than just (listingId, slotIndex).
+    function test_DisputeOnResoldSlotUsesDistinctMarketIdFromItsUndisputedFirstSale() public {
+        uint256 listingId = _openConfirmedListing(); // cycle 1, buyer as the recorded buyer
+        uint256 hypotheticalFirstCycleMarketId = dm.marketIdOf(listingId, 0, 1);
+
+        vm.prank(buyer);
+        lm.confirmCompletion(listingId, 0); // cycle 1 completes clean, no dispute ever opened; slot recycles
+
+        address secondBuyer = makeAddr("secondBuyer");
+        vm.deal(secondBuyer, 1000 ether);
+        vm.prank(settlementStandIn);
+        lm.confirmPayment(listingId, 0, secondBuyer); // cycle 2
+
+        uint256 secondCycleMarketId = _marketId(listingId, 0);
+        assertEq(dm.marketIdOf(listingId, 0, 2), secondCycleMarketId);
+        assertTrue(
+            secondCycleMarketId != hypotheticalFirstCycleMarketId,
+            "the second sale's dispute must never collide with the first sale's (never-opened) marketId"
+        );
+
+        vm.prank(secondBuyer);
+        dm.fundGuiltySide{value: HALF_PRICE}(listingId, 0);
+
+        (bool secondOpened,) = dm.disputes(secondCycleMarketId);
+        assertTrue(secondOpened, "the second sale's dispute opens on its own cycle-2 marketId");
+
+        // Nothing was ever written at the hash a cycle-1 dispute would have used - it was never opened.
+        (bool firstOpened,) = dm.disputes(hypotheticalFirstCycleMarketId);
+        assertFalse(firstOpened);
+        assertEq(dm.guiltyFundingTotal(hypotheticalFirstCycleMarketId), 0);
     }
 
     // ── Adversarial: gas-safety cap on distinct Guilty-side funders ───────────────────────────────────────────

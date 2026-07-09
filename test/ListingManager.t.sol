@@ -171,10 +171,12 @@ contract ListingManagerTest is Test {
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
 
-        (ListingManager.SlotStatus status, uint256 deadline, address recordedBuyer) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status, uint256 deadline, address recordedBuyer, uint256 cycle) =
+            lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.PaymentConfirmed));
         assertEq(deadline, block.timestamp + WINDOW);
         assertEq(recordedBuyer, buyer, "buyer of record must be stored for later restitution routing");
+        assertEq(cycle, 1, "first-ever sale of this slot is cycle 1");
 
         (,,, uint256 emptySlots,,,) = lm.listings(listingId);
         assertEq(emptySlots, 1);
@@ -234,7 +236,7 @@ contract ListingManagerTest is Test {
         lm.finalizeExpiredSlot(listingId, 0);
     }
 
-    function test_FinalizeExpiredSlotSucceedsAfterDeadlineAndIsPermissionless() public {
+    function test_FinalizeExpiredSlotRecyclesToEmptyWithoutUnlockingIB() public {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
         vm.prank(controller);
@@ -244,10 +246,16 @@ contract ListingManagerTest is Test {
         vm.prank(stranger); // anyone may call this - no controller check
         lm.finalizeExpiredSlot(listingId, 0);
 
-        (ListingManager.SlotStatus status, uint256 deadline,) = lm.slots(listingId, 0);
-        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed)); // spent, not recycled to Empty
+        (ListingManager.SlotStatus status, uint256 deadline, address recordedBuyer, uint256 cycle) =
+            lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Empty)); // recycled, ready for the next buyer
         assertEq(deadline, 0);
-        assertEq(bond.freeIB(seller), 100 ether); // fully restored: locked at creation, unlocked at finalization
+        assertEq(recordedBuyer, address(0), "buyer of record is cleared on recycle");
+        assertEq(cycle, 1, "cycle is a permanent counter, untouched by recycling");
+        assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED); // stays locked - still backs this slot's next sale
+
+        (,,, uint256 emptySlots,,,) = lm.listings(listingId);
+        assertEq(emptySlots, 1, "slot becomes reusable capacity again");
     }
 
     function test_FinalizeExpiredSlotRevertsOnEmptySlot() public {
@@ -295,9 +303,9 @@ contract ListingManagerTest is Test {
 
     // ── confirmCompletion (buyer early release) ──────────────────────────────────────────────────────────────────
 
-    event SlotCompleted(uint256 indexed listingId, uint256 indexed slotIndex, address indexed buyer);
+    event SlotCompleted(uint256 indexed listingId, uint256 indexed slotIndex, address indexed buyer, uint256 cycle);
 
-    function test_ConfirmCompletionReleasesIBEarlyAndMarksSlotRemoved() public {
+    function test_ConfirmCompletionRecyclesSlotToEmptyWithoutUnlockingIB() public {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
         vm.prank(controller);
@@ -306,15 +314,20 @@ contract ListingManagerTest is Test {
 
         // Well before the completion window would ever expire, the buyer confirms receipt.
         vm.expectEmit(true, true, true, true);
-        emit SlotCompleted(listingId, 0, buyer);
+        emit SlotCompleted(listingId, 0, buyer, 1);
         vm.prank(buyer);
         lm.confirmCompletion(listingId, 0);
 
-        (ListingManager.SlotStatus status, uint256 deadline, address recordedBuyer) = lm.slots(listingId, 0);
-        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed)); // spent, not recycled to Empty
+        (ListingManager.SlotStatus status, uint256 deadline, address recordedBuyer, uint256 cycle) =
+            lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Empty)); // recycled, not permanently spent
         assertEq(deadline, 0);
-        assertEq(recordedBuyer, buyer, "buyer of record is not erased by completion");
-        assertEq(bond.freeIB(seller), 100 ether); // fully released early, without waiting the window out
+        assertEq(recordedBuyer, address(0), "buyer of record is cleared on recycle");
+        assertEq(cycle, 1);
+        assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED); // stays locked - still backs this slot's next sale
+
+        (,,, uint256 emptySlots,,,) = lm.listings(listingId);
+        assertEq(emptySlots, 1);
     }
 
     function test_ConfirmCompletionRevertsWhenCallerIsNotTheBuyer() public {
@@ -367,7 +380,8 @@ contract ListingManagerTest is Test {
         vm.prank(buyer);
         lm.confirmCompletion(listingId, 0);
 
-        // Slot is Removed now; a second confirm (or a window-expiry finalize) must revert - the IB is already free.
+        // Slot is Empty now (recycled); a second confirm (or a window-expiry finalize) must revert - it is no
+        // longer PaymentConfirmed, regardless of how much locked capital still backs it.
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotPaymentConfirmed.selector, listingId, 0));
         lm.confirmCompletion(listingId, 0);
@@ -408,7 +422,7 @@ contract ListingManagerTest is Test {
 
     /// @notice Completion is per-slot and per-buyer: one buyer confirming their own slot must never release,
     ///         touch, or expose any other slot on the same listing (including another buyer's).
-    function testFuzz_ConfirmCompletionReleasesExactlyOneSlotsWorthAndOnlyTheCallersOwn(
+    function testFuzz_ConfirmCompletionRecyclesExactlyOneSlotAndOnlyTheCallersOwn(
         uint256 totalSlots,
         uint256 confirmCount,
         uint256 completeIndex
@@ -438,15 +452,15 @@ contract ListingManagerTest is Test {
         vm.prank(buyer);
         lm.confirmCompletion(listingId, completeIndex);
 
-        assertEq(bond.freeIB(seller), freeBefore + PER_SLOT_LOCKED, "exactly one slot's IB released");
+        assertEq(bond.freeIB(seller), freeBefore, "IB stays locked - completing a slot never unlocks any capital");
 
-        (ListingManager.SlotStatus target,,) = lm.slots(listingId, completeIndex);
-        assertEq(uint8(target), uint8(ListingManager.SlotStatus.Removed));
+        (ListingManager.SlotStatus target,,,) = lm.slots(listingId, completeIndex);
+        assertEq(uint8(target), uint8(ListingManager.SlotStatus.Empty));
 
         // Every other confirmed slot is untouched - still PaymentConfirmed, still locked.
         for (uint256 i = 0; i < confirmCount; i++) {
             if (i == completeIndex) continue;
-            (ListingManager.SlotStatus s,,) = lm.slots(listingId, i);
+            (ListingManager.SlotStatus s,,,) = lm.slots(listingId, i);
             assertEq(uint8(s), uint8(ListingManager.SlotStatus.PaymentConfirmed));
         }
     }
@@ -464,9 +478,11 @@ contract ListingManagerTest is Test {
         lm.markDisputed(listingId, 0);
     }
 
-    /// @notice A resolved slot is always permanently spent (Removed), never recycled back to Empty - whatever
-    ///         backed it was already unlocked or slashed by DisputeManager before this call, so there is nothing
-    ///         left to reuse without a fresh lock. This holds regardless of whether the listing is still open.
+    /// @notice A resolved slot is always permanently spent (Removed), never recycled back to Empty, regardless of
+    ///         which way the dispute went - the 0.5P joint-injection draw at dispute-open already irreversibly
+    ///         removed half its collateral before any verdict existed, so nothing left locked could satisfy a
+    ///         fresh sale's requirement even on an Innocent verdict. This holds regardless of whether the listing
+    ///         is still open. See {ListingManager-resolveDispute}'s own doc for the full reasoning.
     function test_ResolveDisputeAlwaysMarksSlotRemovedNeverEmpty() public {
         vm.prank(seller);
         uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
@@ -476,10 +492,16 @@ contract ListingManagerTest is Test {
         lm.resolveDispute(listingId, 0);
         vm.stopPrank();
 
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
         (,,, uint256 emptySlots,,,) = lm.listings(listingId);
         assertEq(emptySlots, 0); // Removed does not count as reusable capacity
+
+        // Never sellable again through this slot index - a seller who wants this capacity back creates a new
+        // listing.
+        vm.prank(controller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotEmpty.selector, listingId, 0));
+        lm.confirmPayment(listingId, 0, buyer);
     }
 
     function test_ResolveDisputeOnClosedListingAlsoMarksRemoved() public {
@@ -495,7 +517,7 @@ contract ListingManagerTest is Test {
         lm.resolveDispute(listingId, 0);
         vm.stopPrank();
 
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
         (,,, uint256 emptySlots,,,) = lm.listings(listingId);
         assertEq(emptySlots, 0);
@@ -507,6 +529,63 @@ contract ListingManagerTest is Test {
         vm.prank(controller);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotDisputed.selector, listingId, 0));
         lm.resolveDispute(listingId, 0);
+    }
+
+    // ── Slot reuse (recycling) ─────────────────────────────────────────────────────────────────────────────────
+
+    function test_RecycledSlotCanBeSoldToADifferentBuyerWithBondStillLocked() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+        vm.prank(buyer);
+        lm.confirmCompletion(listingId, 0);
+
+        address secondBuyer = makeAddr("secondBuyer");
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, secondBuyer);
+
+        (ListingManager.SlotStatus status, uint256 deadline, address recordedBuyer, uint256 cycle) =
+            lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.PaymentConfirmed));
+        assertEq(recordedBuyer, secondBuyer);
+        assertEq(cycle, 2, "second sale bumps the cycle counter");
+        assertEq(deadline, block.timestamp + WINDOW);
+        assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED, "same capital keeps backing every sale");
+
+        vm.prank(secondBuyer);
+        lm.confirmCompletion(listingId, 0);
+        assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED, "still locked after the second sale completes");
+    }
+
+    /// @notice A seller can resell the same slot indefinitely without ever creating a new listing, and its
+    ///         Locked IB never moves an inch until the seller explicitly reclaims it - satisfying exactly the
+    ///         "seller shouldn't have to keep re-adding slots at the same price" requirement this design exists
+    ///         for.
+    function testFuzz_SlotSurvivesManySequentialSalesWithBondNeverMovingUntilExplicitlyReduced(uint8 salesSeed) public {
+        uint256 sales = bound(salesSeed, 1, 20);
+
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+
+        for (uint256 i = 0; i < sales; i++) {
+            address cycleBuyer = address(uint160(uint256(keccak256(abi.encode("cycleBuyer", i)))));
+            vm.prank(controller);
+            lm.confirmPayment(listingId, 0, cycleBuyer);
+
+            (,,, uint256 cycle) = lm.slots(listingId, 0);
+            assertEq(cycle, i + 1);
+
+            vm.prank(cycleBuyer);
+            lm.confirmCompletion(listingId, 0);
+            assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED);
+        }
+
+        // The seller can still reclaim the slot's capital any time it's sitting Empty, even after many resales.
+        vm.prank(seller);
+        lm.reduceSlots(listingId, 1);
+        assertEq(bond.freeIB(seller), 100 ether);
     }
 
     // ── reduceSlots / closeListing ─────────────────────────────────────────────────────────────────────────────
@@ -524,8 +603,8 @@ contract ListingManagerTest is Test {
         assertEq(emptySlots, 0);
         assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED * 3 + PER_SLOT_LOCKED * 2);
 
-        (ListingManager.SlotStatus s1,,) = lm.slots(listingId, 1);
-        (ListingManager.SlotStatus s2,,) = lm.slots(listingId, 2);
+        (ListingManager.SlotStatus s1,,,) = lm.slots(listingId, 1);
+        (ListingManager.SlotStatus s2,,,) = lm.slots(listingId, 2);
         assertEq(uint8(s1), uint8(ListingManager.SlotStatus.Removed));
         assertEq(uint8(s2), uint8(ListingManager.SlotStatus.Removed));
     }
@@ -542,7 +621,7 @@ contract ListingManagerTest is Test {
         vm.expectRevert(abi.encodeWithSelector(ListingManager.InsufficientEmptySlots.selector, listingId, 2, 1));
         lm.reduceSlots(listingId, 2); // asking for both is impossible - slot 0 is confirmed, not empty
 
-        (ListingManager.SlotStatus s0,,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus s0,,,) = lm.slots(listingId, 0);
         assertEq(uint8(s0), uint8(ListingManager.SlotStatus.PaymentConfirmed)); // untouched
     }
 
@@ -574,9 +653,9 @@ contract ListingManagerTest is Test {
         // the still-confirmed slot 0 continues its normal lifecycle untouched
         vm.warp(block.timestamp + WINDOW);
         lm.finalizeExpiredSlot(listingId, 0);
-        assertEq(bond.freeIB(seller), 100 ether); // fully released once slot 0 also resolves
-        (ListingManager.SlotStatus s0,,) = lm.slots(listingId, 0);
-        assertEq(uint8(s0), uint8(ListingManager.SlotStatus.Removed)); // spent, not recycled to Empty
+        assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED); // slot 0 recycles, its own IB stays locked
+        (ListingManager.SlotStatus s0,,,) = lm.slots(listingId, 0);
+        assertEq(uint8(s0), uint8(ListingManager.SlotStatus.Empty)); // recycled, not permanently spent
     }
 
     function test_CloseListingRevertsWhenAlreadyClosed() public {
@@ -636,7 +715,7 @@ contract ListingManagerTest is Test {
         lm.reduceSlots(listingId, totalSlots); // requesting all N must fail whenever any slot is confirmed
 
         for (uint256 i = 0; i < confirmCount; i++) {
-            (ListingManager.SlotStatus s,,) = lm.slots(listingId, i);
+            (ListingManager.SlotStatus s,,,) = lm.slots(listingId, i);
             assertEq(uint8(s), uint8(ListingManager.SlotStatus.PaymentConfirmed));
         }
     }

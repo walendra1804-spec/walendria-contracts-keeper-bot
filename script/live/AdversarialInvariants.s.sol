@@ -46,7 +46,7 @@ contract AdversarialInvariantsScript is Script {
         uint256 listingId = _createListing(sellerKey);
         _verifyUnderpaymentReverts(buyerKey, listingId);
         _payListingForReal(buyerKey, listingId);
-        uint256 marketId = disputeManager.marketIdOf(listingId, 0);
+        uint256 marketId = disputeManager.marketIdOf(listingId, 0, 1);
         _openDisputeViaBuyer(buyerKey, listingId, marketId);
         _verifySellerProceedsAloneCannotReach93Percent(sellerKey, marketId);
     }
@@ -85,7 +85,7 @@ contract AdversarialInvariantsScript is Script {
             address(settlement).call{value: P - 1}(abi.encodeWithSelector(Settlement.pay.selector, listingId, 0));
         require(!succeeded, "VIOLATION: payment strictly less than P succeeded");
 
-        (,, address buyerOfRecord) = listingManager.slots(listingId, 0);
+        (,, address buyerOfRecord,) = listingManager.slots(listingId, 0);
         require(buyerOfRecord == address(0), "VIOLATION: slot state changed despite the reverted underpayment");
         console.log("CONFIRMED LIVE: payment strictly less than P reverts with no partial state change.");
     }

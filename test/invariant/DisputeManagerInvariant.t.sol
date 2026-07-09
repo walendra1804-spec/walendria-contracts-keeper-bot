@@ -76,7 +76,7 @@ contract DisputeManagerInvariantTest is Test {
                 (address listingSeller, uint256 price,,,, uint256 perSlotLocked,) = lm.listings(listingId);
                 if (listingSeller != seller) continue;
 
-                (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
+                (ListingManager.SlotStatus status,,,) = lm.slots(listingId, 0);
                 if (status == ListingManager.SlotStatus.Empty || status == ListingManager.SlotStatus.PaymentConfirmed) {
                     expectedLocked += perSlotLocked;
                 } else if (status == ListingManager.SlotStatus.Disputed) {
@@ -98,7 +98,8 @@ contract DisputeManagerInvariantTest is Test {
         uint256 expected = 0;
         for (uint256 i = 0; i < handler.listingIdsCount(); i++) {
             uint256 listingId = handler.listingIds(i);
-            uint256 marketId = dm.marketIdOf(listingId, 0);
+            (,,, uint256 cycle) = lm.slots(listingId, 0);
+            uint256 marketId = dm.marketIdOf(listingId, 0, cycle);
             (bool opened,) = dm.disputes(marketId);
             if (!opened) {
                 expected += dm.guiltyFundingTotal(marketId);

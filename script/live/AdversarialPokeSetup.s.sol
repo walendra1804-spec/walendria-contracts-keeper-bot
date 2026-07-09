@@ -47,7 +47,7 @@ contract AdversarialPokeSetupScript is Script {
         settlement.pay{value: P}(listingId, 0);
         vm.stopBroadcast();
 
-        uint256 marketId = disputeManager.marketIdOf(listingId, 0);
+        uint256 marketId = disputeManager.marketIdOf(listingId, 0, 1);
 
         vm.startBroadcast(buyerKey);
         disputeManager.fundGuiltySide{value: P / 2}(listingId, 0);

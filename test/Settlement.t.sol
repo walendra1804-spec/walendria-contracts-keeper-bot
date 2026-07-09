@@ -121,7 +121,7 @@ contract SettlementTest is Test {
         assertEq(buyerBefore - buyer.balance, PRICE, "buyer should pay exactly PRICE, no refund due");
         assertEq(address(settlement).balance, 0);
 
-        (ListingManager.SlotStatus status, uint256 deadline,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status, uint256 deadline,,) = lm.slots(listingId, 0);
         assertEq(uint256(status), uint256(ListingManager.SlotStatus.PaymentConfirmed));
         assertEq(deadline, block.timestamp + WINDOW);
 
@@ -165,8 +165,8 @@ contract SettlementTest is Test {
         (,,, uint256 emptySlots,,,) = lm.listings(listingId);
         assertEq(emptySlots, SLOTS - 2);
 
-        (ListingManager.SlotStatus status0,,) = lm.slots(listingId, 0);
-        (ListingManager.SlotStatus status1,,) = lm.slots(listingId, 1);
+        (ListingManager.SlotStatus status0,,,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status1,,,) = lm.slots(listingId, 1);
         assertEq(uint256(status0), uint256(ListingManager.SlotStatus.PaymentConfirmed));
         assertEq(uint256(status1), uint256(ListingManager.SlotStatus.PaymentConfirmed));
     }
@@ -234,7 +234,7 @@ contract SettlementTest is Test {
         settlement.pay{value: PRICE}(badListingId, 0);
 
         // Whole call rolled back: the slot must still be Empty, not stuck PaymentConfirmed with no payout.
-        (ListingManager.SlotStatus status,,) = lm.slots(badListingId, 0);
+        (ListingManager.SlotStatus status,,,) = lm.slots(badListingId, 0);
         assertEq(uint256(status), uint256(ListingManager.SlotStatus.Empty));
     }
 
@@ -252,10 +252,10 @@ contract SettlementTest is Test {
         assertTrue(attacker.reentered());
         assertFalse(attacker.reentrySucceeded(), "reentrant pay() should have been blocked");
 
-        (ListingManager.SlotStatus status0,,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status0,,,) = lm.slots(listingId, 0);
         assertEq(uint256(status0), uint256(ListingManager.SlotStatus.PaymentConfirmed), "legitimate call succeeded");
 
-        (ListingManager.SlotStatus status1,,) = lm.slots(listingId, 1);
+        (ListingManager.SlotStatus status1,,,) = lm.slots(listingId, 1);
         assertEq(uint256(status1), uint256(ListingManager.SlotStatus.Empty), "blocked reentry touched nothing");
     }
 
@@ -310,7 +310,7 @@ contract SettlementTest is Test {
         s.devBalance = devPool.balance;
         s.settlementBalance = address(settlement).balance;
         (,,, s.emptySlots,,,) = lm.listings(targetListingId);
-        (s.slotStatus,, s.slotBuyer) = lm.slots(targetListingId, 0);
+        (s.slotStatus,, s.slotBuyer,) = lm.slots(targetListingId, 0);
     }
 
     function testFuzz_RevertsWheneverUnderpaid(uint256 priceSeed, uint256 shortfallSeed) public {

@@ -41,7 +41,7 @@ contract AdversarialLifecycleScript is Script {
 
         uint256 listingId = _createListing(sellerKey);
         _payListing(buyerKey, listingId);
-        uint256 marketId = disputeManager.marketIdOf(listingId, 0);
+        uint256 marketId = disputeManager.marketIdOf(listingId, 0, 1);
         _openDispute(buyerKey, listingId, marketId);
         _pushPriceAndVerifyNoInstantResolution(buyerKey, marketId);
         _mutualCloseAndVerify(sellerKey, buyerKey, listingId, marketId);

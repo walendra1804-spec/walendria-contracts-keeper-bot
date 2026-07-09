@@ -17,9 +17,19 @@ import {SpectralMarket} from "./SpectralMarket.sol";
 ///         ListingManager the slot is permanently spent.
 /// @dev Phase 7 of the build strategy - the module the build strategy itself flags as where "most of the
 ///      project's real complexity concentrates." A dispute is identified by {marketIdOf}, a deterministic hash of
-///      (listingId, slotIndex) - the same value doubles as the SpectralMarket `marketId`, so no separate ID
+///      (listingId, slotIndex, cycle) - the same value doubles as the SpectralMarket `marketId`, so no separate ID
 ///      translation table is needed and the eventual resolution timestamp/market stays independently computable
 ///      by anyone off-chain, consistent with this codebase's existing checkpoint-and-poke design principle.
+///
+///      ListingManager slots are no longer strictly single-use (an undisputed sale recycles a slot back to Empty
+///      so it can be resold), but a slot that ever gets disputed is retired for good regardless of verdict - see
+///      {ListingManager-resolveDispute}'s doc for why. So (listingId, slotIndex) alone still can never collide
+///      across two genuine disputes in practice; `cycle` is folded in here purely to match EvidenceRegistry's
+///      identical-formula `marketIdOf`, which genuinely does need it (Section 2.6.2 evidence isn't limited to
+///      disputed slots, so it *can* collide across an undisputed slot's repeat sales). Every entry point below
+///      reads `cycle` fresh from ListingManager rather than caching it, which is always correct: a slot's cycle
+///      cannot advance while a dispute against its current cycle is still open, since that requires passing back
+///      through Empty first, and Disputed only ever resolves via {ListingManager-resolveDispute} below.
 ///
 ///      Scope decision worth flagging explicitly, mirroring ListingManager's own Phase-3 note: {mutualClose}'s
 ///      second scope restriction (Section 2.6.10 - unavailable if any portion of the seller's Locked IB is Shared
@@ -109,14 +119,15 @@ contract DisputeManager is ReentrancyGuard {
         if (seller == address(0)) revert ListingNotFound(listingId);
         if (slotIndex >= totalSlots) revert SlotIndexOutOfRange(slotIndex, totalSlots);
 
-        (ListingManager.SlotStatus status, uint256 completionDeadline,) = listingManager.slots(listingId, slotIndex);
+        (ListingManager.SlotStatus status, uint256 completionDeadline,, uint256 cycle) =
+            listingManager.slots(listingId, slotIndex);
         if (status != ListingManager.SlotStatus.PaymentConfirmed) revert SlotNotDisputable(listingId, slotIndex);
         if (block.timestamp >= completionDeadline) revert WindowExpired(listingId, slotIndex, completionDeadline);
 
         uint256 halfPrice = price / 2;
         if (halfPrice == 0) revert PriceTooSmallToDispute(listingId, price);
 
-        uint256 marketId = marketIdOf(listingId, slotIndex);
+        uint256 marketId = marketIdOf(listingId, slotIndex, cycle);
         GuiltyFunding storage gf = _guiltyFunding[marketId];
 
         uint256 remaining = halfPrice - gf.total;
@@ -163,12 +174,12 @@ contract DisputeManager is ReentrancyGuard {
     ///      itself nonReentrant regardless - same trust model already accepted for SpectralMarket's own call into
     ///      SettlementConditions (Phase 6).
     function mutualClose(uint256 listingId, uint256 slotIndex, SpectralMarket.Side verdict) external nonReentrant {
-        uint256 marketId = marketIdOf(listingId, slotIndex);
+        (,, address buyer, uint256 cycle) = listingManager.slots(listingId, slotIndex);
+        uint256 marketId = marketIdOf(listingId, slotIndex, cycle);
         if (!disputes[marketId].opened) revert DisputeNotOpen(marketId);
         if (disputes[marketId].finalized) revert DisputeAlreadyFinalized(marketId);
 
         (address seller,,,,,,) = listingManager.listings(listingId);
-        (,, address buyer) = listingManager.slots(listingId, slotIndex);
         if (msg.sender != buyer && msg.sender != seller) revert NotPartyToDispute(msg.sender, buyer, seller);
 
         (,,,,, bool resolved,) = spectralMarket.markets(marketId);
@@ -195,12 +206,12 @@ contract DisputeManager is ReentrancyGuard {
     ///         path, so calling this afterward for a mutual-close-resolved dispute simply reverts
     ///         (DisputeAlreadyFinalized) rather than double-applying anything.
     function finalizeDispute(uint256 listingId, uint256 slotIndex) external nonReentrant {
-        uint256 marketId = marketIdOf(listingId, slotIndex);
+        (,, address buyer, uint256 cycle) = listingManager.slots(listingId, slotIndex);
+        uint256 marketId = marketIdOf(listingId, slotIndex, cycle);
         if (!disputes[marketId].opened) revert DisputeNotOpen(marketId);
         if (disputes[marketId].finalized) revert DisputeAlreadyFinalized(marketId);
 
         (address seller,,,,,,) = listingManager.listings(listingId);
-        (,, address buyer) = listingManager.slots(listingId, slotIndex);
 
         (,,,,, bool resolved, SpectralMarket.Side winningSide) = spectralMarket.markets(marketId);
         if (!resolved) revert MarketNotResolvedYet(marketId);
@@ -208,11 +219,15 @@ contract DisputeManager is ReentrancyGuard {
         _finalize(listingId, slotIndex, marketId, seller, buyer, winningSide);
     }
 
-    /// @notice Deterministic (listingId, slotIndex) -> marketId mapping, independently computable by anyone -
-    ///         there is exactly one SpectralMarket market per disputed slot, and a slot can only ever be disputed
-    ///         once (ListingManager's slot lifecycle is one-directional).
-    function marketIdOf(uint256 listingId, uint256 slotIndex) public pure returns (uint256) {
-        return uint256(keccak256(abi.encode(listingId, slotIndex)));
+    /// @notice Deterministic (listingId, slotIndex, cycle) -> marketId mapping, independently computable by
+    ///         anyone - there is exactly one SpectralMarket market per disputed *use* of a slot. `cycle` must be
+    ///         ListingManager's live {ListingManager-Slot-cycle} for that slot at the time the dispute in question
+    ///         was opened - every entry point in this contract reads it fresh from ListingManager rather than
+    ///         caching it, which is always correct because a slot's cycle cannot advance while a dispute against
+    ///         its current cycle is still open (that requires the slot to pass back through Empty first, and
+    ///         Disputed only ever resolves via {ListingManager-resolveDispute}, called from {_finalize} below).
+    function marketIdOf(uint256 listingId, uint256 slotIndex, uint256 cycle) public pure returns (uint256) {
+        return uint256(keccak256(abi.encode(listingId, slotIndex, cycle)));
     }
 
     function guiltyFundingTotal(uint256 marketId) external view returns (uint256) {
@@ -346,6 +361,8 @@ contract DisputeManager is ReentrancyGuard {
             integrityBond.unlock(seller, remainingLocked);
         }
 
+        // Whichever way it went, the slot is permanently spent - see ListingManager's {resolveDispute} doc for
+        // why even an Innocent verdict can't leave it resellable.
         listingManager.resolveDispute(listingId, slotIndex);
 
         emit DisputeFinalized(marketId, winningSide, remainingLocked);

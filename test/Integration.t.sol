@@ -96,7 +96,11 @@ contract IntegrationTest is Test {
 
         vm.warp(block.timestamp + WINDOW);
         lm.finalizeExpiredSlot(listingId, 0);
-        assertEq(bond.freeIB(seller), 3 ether, "Locked IB fully released with no dispute ever opening");
+        assertEq(bond.freeIB(seller), 0, "capital stays locked with no dispute - it still backs the slot's resale");
+
+        vm.prank(seller);
+        lm.reduceSlots(listingId, 1); // seller explicitly reclaims it instead of reselling
+        assertEq(bond.freeIB(seller), 3 ether, "Locked IB fully released once the seller stops offering the slot");
 
         vm.prank(developer);
         devPool.withdraw(address(devPool).balance);
@@ -108,7 +112,7 @@ contract IntegrationTest is Test {
     function test_DisputedTransactionResolvesGuiltyViaPriceThresholdAndBuyerClaimsRestitution() public {
         uint256 price = 10 ether;
         uint256 listingId = _paidListing(price);
-        uint256 marketId = dm.marketIdOf(listingId, 0);
+        uint256 marketId = _marketId(listingId, 0);
 
         vm.prank(buyer);
         dm.fundGuiltySide{value: price / 2}(listingId, 0);
@@ -143,7 +147,7 @@ contract IntegrationTest is Test {
         assertEq(uint8(winningSide), uint8(SpectralMarket.Side.Guilty));
 
         dm.finalizeDispute(listingId, 0);
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
 
         uint256 buyerBefore = buyer.balance;
@@ -164,7 +168,7 @@ contract IntegrationTest is Test {
     function test_DisputedTransactionResolvesInnocentAndSellerIBUnlocks() public {
         uint256 price = 10 ether;
         uint256 listingId = _paidListing(price);
-        uint256 marketId = dm.marketIdOf(listingId, 0);
+        uint256 marketId = _marketId(listingId, 0);
 
         vm.prank(backer);
         dm.fundGuiltySide{value: price / 2}(listingId, 0);
@@ -198,7 +202,7 @@ contract IntegrationTest is Test {
     function test_DisputeResolvesViaMutualCloseWhenSolelyBuyerFunded() public {
         uint256 price = 10 ether;
         uint256 listingId = _paidListing(price);
-        uint256 marketId = dm.marketIdOf(listingId, 0);
+        uint256 marketId = _marketId(listingId, 0);
 
         vm.prank(buyer);
         dm.fundGuiltySide{value: price / 2}(listingId, 0);
@@ -210,7 +214,7 @@ contract IntegrationTest is Test {
 
         (,,,,, bool resolved,) = market.markets(marketId);
         assertTrue(resolved, "mutualClose should self-finalize inline");
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, 0);
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, 0);
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Removed));
     }
 
@@ -219,7 +223,7 @@ contract IntegrationTest is Test {
     function test_DisputeResolvesViaPokeWithNoFurtherTradesAfterThresholdCrossed() public {
         uint256 price = 10 ether;
         uint256 listingId = _paidListing(price);
-        uint256 marketId = dm.marketIdOf(listingId, 0);
+        uint256 marketId = _marketId(listingId, 0);
 
         vm.prank(buyer);
         dm.fundGuiltySide{value: price / 2}(listingId, 0);
@@ -266,7 +270,7 @@ contract IntegrationTest is Test {
     function test_ResolutionSurplusSweepsToDeveloperPool() public {
         uint256 price = 10 ether;
         uint256 listingId = _paidListing(price);
-        uint256 marketId = dm.marketIdOf(listingId, 0);
+        uint256 marketId = _marketId(listingId, 0);
 
         vm.prank(buyer);
         dm.fundGuiltySide{value: price / 2}(listingId, 0);
@@ -297,6 +301,11 @@ contract IntegrationTest is Test {
         SD59x18 p = sd(int256(priceWad));
         SD59x18 delta = b * (p / (UNIT - p)).ln();
         return uint256(SD59x18.unwrap(delta));
+    }
+
+    function _marketId(uint256 listingId, uint256 slotIndex) internal view returns (uint256) {
+        (,,, uint256 cycle) = lm.slots(listingId, slotIndex);
+        return dm.marketIdOf(listingId, slotIndex, cycle);
     }
 
     function _paidListing(uint256 price) internal returns (uint256 listingId) {

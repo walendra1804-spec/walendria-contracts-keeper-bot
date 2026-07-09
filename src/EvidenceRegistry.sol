@@ -25,8 +25,8 @@ contract EvidenceRegistry {
 
     ListingManager public immutable listingManager;
 
-    /// @param marketId Identical derivation to {DisputeManager-marketIdOf} - keccak256(listingId, slotIndex) -
-    ///        so evidence, trades, and dispute state all join on the same key without a translation table.
+    /// @param marketId Identical derivation to {DisputeManager-marketIdOf} - keccak256(listingId, slotIndex, cycle)
+    ///        - so evidence, trades, and dispute state all join on the same key without a translation table.
     event EvidenceSubmitted(
         uint256 indexed marketId, address indexed submitter, uint256 listingId, uint256 slotIndex, string cid
     );
@@ -43,27 +43,30 @@ contract EvidenceRegistry {
     ///         slot's seller or its confirmed buyer, at any time - including before a dispute formally exists on
     ///         DisputeManager (Section 2.4: a buyer must be able to publicize a case *before* attracting the
     ///         0.5P of Guilty-side funding that creates the dispute object at all). Deliberately does not check
-    ///         slot status: before payment confirmation, `buyer` reads as address(0), which msg.sender can never
-    ///         equal, so only the seller can submit at that stage - exactly the outcome a status check would
-    ///         have enforced explicitly, without adding a dependency on ListingManager's SlotStatus enum.
+    ///         slot status: before payment confirmation (or once a slot has recycled back to Empty awaiting its
+    ///         next buyer), `buyer` reads as address(0), which msg.sender can never equal, so only the seller can
+    ///         submit at that stage - exactly the outcome a status check would have enforced explicitly, without
+    ///         adding a dependency on ListingManager's SlotStatus enum.
     function submitEvidence(uint256 listingId, uint256 slotIndex, string calldata cid) external {
         uint256 cidLength = bytes(cid).length;
         if (cidLength == 0) revert EmptyCid();
         if (cidLength > MAX_CID_LENGTH) revert CidTooLong(cidLength, MAX_CID_LENGTH);
 
         (address seller,,,,,,) = listingManager.listings(listingId);
-        (,, address buyer) = listingManager.slots(listingId, slotIndex);
+        (,, address buyer, uint256 cycle) = listingManager.slots(listingId, slotIndex);
         if (msg.sender != seller && msg.sender != buyer) {
             revert NotBuyerOrSeller(listingId, slotIndex, msg.sender);
         }
 
-        emit EvidenceSubmitted(marketIdOf(listingId, slotIndex), msg.sender, listingId, slotIndex, cid);
+        emit EvidenceSubmitted(marketIdOf(listingId, slotIndex, cycle), msg.sender, listingId, slotIndex, cid);
     }
 
     /// @notice Deterministic dispute/market identifier, identical to {DisputeManager-marketIdOf}. Kept as an
     ///         independent pure function - not a cross-contract call - so this registry has zero runtime
-    ///         dependency on DisputeManager ever being deployed, upgraded, or even existing.
-    function marketIdOf(uint256 listingId, uint256 slotIndex) public pure returns (uint256) {
-        return uint256(keccak256(abi.encode(listingId, slotIndex)));
+    ///         dependency on DisputeManager ever being deployed, upgraded, or even existing. `cycle` must be
+    ///         ListingManager's live per-slot cycle counter, same requirement as DisputeManager's own copy of
+    ///         this function - see that doc for why reading it live is always correct.
+    function marketIdOf(uint256 listingId, uint256 slotIndex, uint256 cycle) public pure returns (uint256) {
+        return uint256(keccak256(abi.encode(listingId, slotIndex, cycle)));
     }
 }

@@ -47,7 +47,7 @@ contract ListingManagerHandler is Test {
         (,, uint256 totalSlots,,,, bool closed) = lm.listings(listingId);
         if (closed) return;
         uint256 slotIndex = slotSeed % totalSlots;
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, slotIndex);
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, slotIndex);
         if (status != ListingManager.SlotStatus.Empty) return;
 
         address buyer = makeAddr(string.concat("handlerBuyer", vm.toString(listingId), vm.toString(slotIndex)));
@@ -60,7 +60,7 @@ contract ListingManagerHandler is Test {
         uint256 listingId = _pickListing(listingSeed);
         (,, uint256 totalSlots,,,,) = lm.listings(listingId);
         uint256 slotIndex = slotSeed % totalSlots;
-        (ListingManager.SlotStatus status, uint256 deadline,) = lm.slots(listingId, slotIndex);
+        (ListingManager.SlotStatus status, uint256 deadline,,) = lm.slots(listingId, slotIndex);
         if (status != ListingManager.SlotStatus.PaymentConfirmed) return;
         if (block.timestamp < deadline) {
             vm.warp(deadline);
@@ -73,7 +73,7 @@ contract ListingManagerHandler is Test {
         uint256 listingId = _pickListing(listingSeed);
         (,, uint256 totalSlots,,,,) = lm.listings(listingId);
         uint256 slotIndex = slotSeed % totalSlots;
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, slotIndex);
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, slotIndex);
         if (status != ListingManager.SlotStatus.PaymentConfirmed) return;
 
         vm.prank(controller);
@@ -85,13 +85,17 @@ contract ListingManagerHandler is Test {
         uint256 listingId = _pickListing(listingSeed);
         (address seller,, uint256 totalSlots,,, uint256 perSlotLocked,) = lm.listings(listingId);
         uint256 slotIndex = slotSeed % totalSlots;
-        (ListingManager.SlotStatus status,,) = lm.slots(listingId, slotIndex);
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, slotIndex);
         if (status != ListingManager.SlotStatus.Disputed) return;
 
-        // Stand in for DisputeManager (Phase 7): unlock the slot's IB directly on the bond *before* telling
-        // ListingManager the dispute resolved - resolveDispute() itself deliberately moves no funds. This picks
-        // the simplest (Innocent-verdict-style) resolution; a Guilty verdict would slash instead, but either
-        // way the bond-side movement must happen here, mirroring what the real controller is required to do.
+        // Stand in for DisputeManager (Phase 7): unlock the slot's remaining IB directly on the bond *before*
+        // telling ListingManager the dispute resolved - resolveDispute() itself deliberately moves no funds. This
+        // handler never simulates the 0.5P joint-injection draw that a real markDisputed-adjacent dispute-open
+        // would have already slashed away, so the full perSlotLocked is still genuinely sitting in `locked` here
+        // regardless of which verdict this stands in for - releasing all of it on resolution is the correct bond
+        // movement for this simplified world. Whichever verdict it stands in for, resolveDispute() itself always
+        // moves the slot to Removed (never back to Empty) - see ListingManager's own doc for why even an
+        // Innocent-style resolution can't leave a slot resellable once it has ever been disputed.
         vm.prank(controller);
         bond.unlock(seller, perSlotLocked);
 

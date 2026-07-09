@@ -53,12 +53,17 @@ contract EvidenceRegistryTest is Test {
         lm.confirmPayment(listingId, 0, buyer);
     }
 
+    function _marketId(uint256 targetListingId, uint256 slotIndex) internal view returns (uint256) {
+        (,,, uint256 cycle) = lm.slots(targetListingId, slotIndex);
+        return registry.marketIdOf(targetListingId, slotIndex, cycle);
+    }
+
     // ── Happy path ─────────────────────────────────────────────────────────────────────────────────────────────
 
     function test_SellerCanSubmitEvidenceBeforePaymentConfirmed() public {
         // marketIdOf is an external view call on `registry` - computing it before vm.prank so it doesn't itself
         // consume the single-use prank meant for the real submitEvidence call below.
-        uint256 marketId = registry.marketIdOf(listingId, 0);
+        uint256 marketId = _marketId(listingId, 0);
 
         vm.expectEmit(true, true, false, true, address(registry));
         emit EvidenceRegistry.EvidenceSubmitted(marketId, seller, listingId, 0, "ipfs://bafySellerEarlyEvidence");
@@ -69,7 +74,7 @@ contract EvidenceRegistryTest is Test {
 
     function test_BuyerCanSubmitEvidenceAfterPaymentConfirmed() public {
         _confirmSlot0ForBuyer();
-        uint256 marketId = registry.marketIdOf(listingId, 0);
+        uint256 marketId = _marketId(listingId, 0);
 
         vm.expectEmit(true, true, false, true, address(registry));
         emit EvidenceRegistry.EvidenceSubmitted(marketId, buyer, listingId, 0, "ipfs://bafyBuyerEvidence");
@@ -103,9 +108,9 @@ contract EvidenceRegistryTest is Test {
     function test_MarketIdMatchesDisputeManagerDerivation() public view {
         // DisputeManager.marketIdOf uses the identical one-line formula (verified by inspection) - duplicated
         // here directly rather than via a deployed DisputeManager instance, since both are pure functions with
-        // no shared state to wire up.
-        uint256 expected = uint256(keccak256(abi.encode(listingId, uint256(0))));
-        assertEq(registry.marketIdOf(listingId, 0), expected);
+        // no shared state to wire up. Slot 0 has never been paid for in this test, so its cycle is still 0.
+        uint256 expected = uint256(keccak256(abi.encode(listingId, uint256(0), uint256(0))));
+        assertEq(registry.marketIdOf(listingId, 0, 0), expected);
     }
 
     // ── Reverts ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -203,10 +208,13 @@ contract EvidenceRegistryTest is Test {
         registry.submitEvidence(listingId, 0, "ipfs://bafyFuzzAttempt");
     }
 
-    function testFuzz_MarketIdDerivationMatchesFormula(uint256 listingIdSeed, uint256 slotIndexSeed) public view {
+    function testFuzz_MarketIdDerivationMatchesFormula(uint256 listingIdSeed, uint256 slotIndexSeed, uint256 cycleSeed)
+        public
+        view
+    {
         assertEq(
-            registry.marketIdOf(listingIdSeed, slotIndexSeed),
-            uint256(keccak256(abi.encode(listingIdSeed, slotIndexSeed)))
+            registry.marketIdOf(listingIdSeed, slotIndexSeed, cycleSeed),
+            uint256(keccak256(abi.encode(listingIdSeed, slotIndexSeed, cycleSeed)))
         );
     }
 

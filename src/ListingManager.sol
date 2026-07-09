@@ -9,14 +9,31 @@ import {IntegrityBond} from "./IntegrityBond.sol";
 ///         transaction of price P supporting N simultaneous slots, locking 1.5*P*N of Integrity Bond immediately
 ///         - before any buyer appears. Each slot independently tracks payment confirmation and its completion
 ///         window (a seller-configurable duration, floored at a 72-hour protocol minimum), after which it
-///         finalizes and releases its share of Locked IB if no dispute ever opened against it.
-/// @dev Each slot is single-use: once payment confirms, that slot moves forward (PaymentConfirmed -> Disputed ->
-///      Removed, or PaymentConfirmed -> Removed via window expiry or the buyer confirming completion early) and
-///      never returns to Empty. A slot's Locked
-///      IB is only ever genuinely backed while the *listing* holds it from creation onward; recycling a "spent"
-///      slot back to Empty without re-locking would let a future buyer transact against a slot with nothing
-///      actually bonded behind it. A seller wanting more concurrent capacity after slots are spent creates a
-///      new listing. Only never-yet-used (Empty) slots can be reclaimed early, via {reduceSlots}/{closeListing}.
+///         finalizes and releases back to Empty - ready for the next buyer - if no dispute ever opened against it.
+/// @dev A slot's Locked IB backs the *offer*, not any single completed transaction: {confirmCompletion} and
+///      window-expiry finalization ({finalizeExpiredSlot}) both return the slot straight to Empty, incrementing
+///      {Listing-emptySlots}, WITHOUT unlocking its per-slot Integrity Bond - the capital was never actually
+///      spent, so it stays put, still fully backing this slot index for whichever buyer pays it next. This lets a
+///      seller keep reselling the same slot indefinitely without ever having to create a new listing at the same
+///      price, as long as none of its sales are ever disputed.
+///
+///      A dispute changes that permanently, regardless of its eventual verdict: the instant one opens, Section
+///      2.6.1's 0.5P joint-injection draw irreversibly removes half the slot's collateral from Locked via
+///      `slash` (not `unlock` - a real deduction, not a recategorization), before any verdict is even known. Even
+///      an Innocent verdict only unlocks the *other* untouched half back to Free IB (Section 3.2) - it never
+///      restores the half that was already drawn. So a disputed slot can never again satisfy its own
+///      `perSlotLocked` requirement without a fresh lock, and {resolveDispute} always moves it to Removed
+///      permanently, exactly like the original single-use design, whichever way the dispute resolved. A seller
+///      wanting to keep offering that slot index after a dispute creates a new listing. A seller who instead
+///      wants to stop offering a currently-Empty slot (whether never-yet-used or freshly recycled by an
+///      undisputed completion) reclaims its Locked IB early via {reduceSlots}/{closeListing}.
+///
+///      Because a slot can now be paid for and completed more than once, each Slot tracks a monotonically
+///      increasing `cycle`, bumped every {confirmPayment} - the Nth time a given slot index is paid for.
+///      EvidenceRegistry's evidence key folds `cycle` in too (Section 2.6.2 evidence is not limited to disputed
+///      slots - it can be submitted for any confirmed sale), so evidence for this slot's 2nd sale can never
+///      collide with evidence left behind by its 1st, even though - unlike evidence - a given slot index can
+///      only ever carry one genuine dispute in its whole lifetime.
 ///
 /// @dev Phase 3 of the build strategy. Scope decision worth flagging explicitly: this contract locks listings
 ///      with **direct Integrity Bond only** (IntegrityBond.sol). Section 2.6.10 anticipates a listing's Locked
@@ -58,7 +75,8 @@ contract ListingManager {
     struct Slot {
         SlotStatus status;
         uint256 completionDeadline; // meaningful only while status == PaymentConfirmed
-        address buyer; // meaningful only once status has passed Empty; set once, at confirmPayment, never reset
+        address buyer; // the current cycle's buyer; reset to address(0) whenever the slot recycles back to Empty
+        uint256 cycle; // bumped on every confirmPayment; disambiguates repeat uses of the same slot index
     }
 
     /// @notice Protocol-enforced floor (Section 2.5, 2.9): no listing may offer a shorter completion window.
@@ -91,12 +109,16 @@ contract ListingManager {
         uint256 perSlotLocked
     );
     event SlotPaymentConfirmed(
-        uint256 indexed listingId, uint256 indexed slotIndex, address indexed buyer, uint256 completionDeadline
+        uint256 indexed listingId,
+        uint256 indexed slotIndex,
+        address indexed buyer,
+        uint256 completionDeadline,
+        uint256 cycle
     );
-    event SlotFinalized(uint256 indexed listingId, uint256 indexed slotIndex);
-    event SlotCompleted(uint256 indexed listingId, uint256 indexed slotIndex, address indexed buyer);
-    event SlotDisputed(uint256 indexed listingId, uint256 indexed slotIndex);
-    event SlotResolved(uint256 indexed listingId, uint256 indexed slotIndex);
+    event SlotFinalized(uint256 indexed listingId, uint256 indexed slotIndex, uint256 cycle);
+    event SlotCompleted(uint256 indexed listingId, uint256 indexed slotIndex, address indexed buyer, uint256 cycle);
+    event SlotDisputed(uint256 indexed listingId, uint256 indexed slotIndex, uint256 cycle);
+    event SlotResolved(uint256 indexed listingId, uint256 indexed slotIndex, uint256 cycle);
     event SlotsReduced(uint256 indexed listingId, uint256 count);
     event ListingClosed(uint256 indexed listingId);
 
@@ -172,9 +194,9 @@ contract ListingManager {
         emit ListingCreated(listingId, msg.sender, price, totalSlots, completionWindow, perSlotLocked);
     }
 
-    /// @notice Marks `slotIndex` as paid, starting its completion-window clock, and records `buyer` as the slot's
-    ///         permanent buyer of record. Called by Settlement.sol in the same atomic step that verifies payment
-    ///         (Section 2.3), passing through its own `msg.sender`.
+    /// @notice Marks `slotIndex` as paid, starting its completion-window clock, and records `buyer` as this cycle's
+    ///         buyer of record. Called by Settlement.sol in the same atomic step that verifies payment (Section
+    ///         2.3), passing through its own `msg.sender`.
     /// @dev `buyer` is stored (not just emitted) because DisputeManager.sol (Phase 7) needs it later: Section 3.1
     ///      restitution is paid to the defrauded buyer specifically, "regardless of who funded the Guilty-side
     ///      position" - which can be a mix of the buyer and outside backers (Section 2.4). Without persisting the
@@ -190,20 +212,21 @@ contract ListingManager {
         slot.status = SlotStatus.PaymentConfirmed;
         slot.completionDeadline = block.timestamp + listing.completionWindow;
         slot.buyer = buyer;
+        slot.cycle += 1;
         listing.emptySlots -= 1;
 
-        emit SlotPaymentConfirmed(listingId, slotIndex, buyer, slot.completionDeadline);
+        emit SlotPaymentConfirmed(listingId, slotIndex, buyer, slot.completionDeadline, slot.cycle);
     }
 
     /// @notice Permissionlessly finalizes a slot whose completion window has elapsed with no dispute ever
-    ///         opened (Section 2.5), releasing its full Locked IB back to the seller's Free IB. No bounty exists
-    ///         for calling this - the seller already has the direct incentive, since it frees their own capital.
+    ///         opened (Section 2.5). No bounty exists for calling this - the seller already has the direct
+    ///         incentive, since it frees the slot up for its next buyer.
     ///
-    ///         The slot is permanently spent, not recycled to Empty: once its capital has been released, nothing
-    ///         backs it any more, and silently reusing it for a new buyer without re-locking would let a
-    ///         transaction proceed with no real Integrity Bond behind it - exactly the failure mode this whole
-    ///         mechanism exists to prevent. A seller who wants more concurrent capacity after a slot finalizes
-    ///         creates a new listing (or a future listing-topup primitive, not built here).
+    ///         The slot recycles to Empty rather than being permanently spent: its Locked IB is untouched by this
+    ///         call (no unlock), because that capital was never actually at risk of anything beyond what the
+    ///         listing already committed it to - it keeps backing this same slot index for whoever pays it next.
+    ///         A seller who instead wants to stop offering this slot reclaims its Locked IB via
+    ///         {reduceSlots}/{closeListing}, same as any other currently-Empty slot.
     function finalizeExpiredSlot(uint256 listingId, uint256 slotIndex) external {
         Listing storage listing = _requireListing(listingId);
         if (slotIndex >= listing.totalSlots) revert SlotIndexOutOfRange(slotIndex, listing.totalSlots);
@@ -214,25 +237,26 @@ contract ListingManager {
             revert WindowNotYetExpired(listingId, slotIndex, slot.completionDeadline);
         }
 
-        slot.status = SlotStatus.Removed;
+        slot.status = SlotStatus.Empty;
         slot.completionDeadline = 0;
-        integrityBond.unlock(listing.seller, listing.perSlotLocked);
+        slot.buyer = address(0);
+        listing.emptySlots += 1;
 
-        emit SlotFinalized(listingId, slotIndex);
+        emit SlotFinalized(listingId, slotIndex, slot.cycle);
     }
 
     /// @notice Lets a slot's recorded buyer finalize it early - before its completion window has elapsed -
-    ///         releasing the seller's Locked IB back to Free IB immediately (Section 2.5, buyer-side extension).
-    ///         The completion window is the buyer's protection: the interval in which they may open a dispute.
-    ///         This function is the buyer voluntarily waiving the *remainder* of that window once they are
-    ///         satisfied, so the seller's capital is freed without waiting the window out. Only the buyer of
-    ///         record may call it, and only while the slot is still PaymentConfirmed.
+    ///         freeing the slot up for its next buyer immediately (Section 2.5, buyer-side extension). The
+    ///         completion window is the buyer's protection: the interval in which they may open a dispute. This
+    ///         function is the buyer voluntarily waiving the *remainder* of that window once they are satisfied.
+    ///         Only the buyer of record may call it, and only while the slot is still PaymentConfirmed.
     ///
-    ///         Like {finalizeExpiredSlot}, the slot goes to Removed rather than back to Empty (its capital has
-    ///         been released, so nothing backs it any more), and confirming completion permanently gives up the
-    ///         right to dispute this slot: {markDisputed} requires PaymentConfirmed, which this call moves past.
-    ///         A buyer who has NOT received what they paid for must open a dispute instead of confirming - this
-    ///         is the satisfied-path counterpart to that, never a substitute for it.
+    ///         Like {finalizeExpiredSlot}, the slot recycles to Empty rather than being permanently spent - its
+    ///         Locked IB is untouched, still backing this same slot index for whoever pays it next - and
+    ///         confirming completion permanently gives up the right to dispute *this* sale: {markDisputed}
+    ///         requires PaymentConfirmed, which this call moves past. A buyer who has NOT received what they paid
+    ///         for must open a dispute instead of confirming - this is the satisfied-path counterpart to that,
+    ///         never a substitute for it.
     function confirmCompletion(uint256 listingId, uint256 slotIndex) external {
         Listing storage listing = _requireListing(listingId);
         if (slotIndex >= listing.totalSlots) revert SlotIndexOutOfRange(slotIndex, listing.totalSlots);
@@ -241,11 +265,12 @@ contract ListingManager {
         if (slot.status != SlotStatus.PaymentConfirmed) revert SlotNotPaymentConfirmed(listingId, slotIndex);
         if (msg.sender != slot.buyer) revert NotBuyer(msg.sender, slot.buyer);
 
-        slot.status = SlotStatus.Removed;
+        slot.status = SlotStatus.Empty;
         slot.completionDeadline = 0;
-        integrityBond.unlock(listing.seller, listing.perSlotLocked);
+        slot.buyer = address(0);
+        listing.emptySlots += 1;
 
-        emit SlotCompleted(listingId, slotIndex, msg.sender);
+        emit SlotCompleted(listingId, slotIndex, msg.sender, slot.cycle);
     }
 
     /// @notice Freezes `slotIndex` against window-expiry finalization once a dispute has opened against it
@@ -257,22 +282,29 @@ contract ListingManager {
         Slot storage slot = slots[listingId][slotIndex];
         if (slot.status != SlotStatus.PaymentConfirmed) revert SlotNotPaymentConfirmed(listingId, slotIndex);
         slot.status = SlotStatus.Disputed;
-        emit SlotDisputed(listingId, slotIndex);
+        emit SlotDisputed(listingId, slotIndex, slot.cycle);
     }
 
-    /// @notice Marks a disputed slot permanently spent once its dispute has resolved. The controller
-    ///         (DisputeManager) is responsible for having already called `unlock`/`slash` on {integrityBond}
-    ///         directly for whatever the verdict requires (Section 3.1, 3.2) - this function only updates slot
-    ///         status/bookkeeping, it moves no funds itself. Like {finalizeExpiredSlot}, the slot goes to
-    ///         Removed rather than back to Empty, for the same reason: whatever IB backed it has already been
-    ///         disposed of (unlocked or slashed) by the time this is called, so there is nothing left to reuse.
+    /// @notice Marks a disputed slot permanently spent once its dispute has resolved, whichever way it went. The
+    ///         controller (DisputeManager) is responsible for having already called `unlock`/`slash` on
+    ///         {integrityBond} directly for whatever the verdict requires (Section 3.1, 3.2) - this function only
+    ///         updates slot status/bookkeeping, it moves no funds itself.
+    /// @dev Unlike {finalizeExpiredSlot}/{confirmCompletion}, this never recycles to Empty, regardless of verdict:
+    ///      Section 2.6.1's 0.5P joint-injection draw already irreversibly removed half this slot's collateral the
+    ///      instant the dispute opened, before any verdict existed. Even the Innocent path only unlocks the other,
+    ///      untouched half (Section 3.2) - it never restores the half already drawn - so by the time either
+    ///      verdict reaches this function, nothing remains locked that could satisfy a fresh `perSlotLocked`
+    ///      requirement for reselling this slot index. A seller who wants to keep offering this slot index after
+    ///      a dispute creates a new listing.
     function resolveDispute(uint256 listingId, uint256 slotIndex) external onlyController {
         _requireListing(listingId);
         Slot storage slot = slots[listingId][slotIndex];
         if (slot.status != SlotStatus.Disputed) revert SlotNotDisputed(listingId, slotIndex);
+
         slot.status = SlotStatus.Removed;
         slot.completionDeadline = 0;
-        emit SlotResolved(listingId, slotIndex);
+
+        emit SlotResolved(listingId, slotIndex, slot.cycle);
     }
 
     /// @notice Releases `count` currently-empty slots' Locked IB back to Free IB, permanently removing that much

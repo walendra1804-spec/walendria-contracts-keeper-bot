@@ -100,7 +100,7 @@ contract AdversarialPathIndependenceScript is Script {
         settlement.pay{value: P}(listingId, 0);
         vm.stopBroadcast();
 
-        marketId = disputeManager.marketIdOf(listingId, 0);
+        marketId = disputeManager.marketIdOf(listingId, 0, 1);
     }
 
     function _runOrderIndependence(uint256 sellerKey, uint256 buyerKey, uint256 backer1Key, uint256 backer2Key)

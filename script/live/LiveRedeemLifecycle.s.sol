@@ -47,7 +47,7 @@ contract LiveRedeemLifecycleScript is Script {
         uint256 listingId = _createListing(sellerKey);
         _pay(buyerKey, listingId);
 
-        uint256 marketId = disputeManager.marketIdOf(listingId, 0);
+        uint256 marketId = disputeManager.marketIdOf(listingId, 0, 1);
         _openDispute(buyerKey, listingId, marketId);
         _pushGuiltyPast93(buyerKey, marketId);
         _mutualCloseGuilty(sellerKey, buyerKey, listingId, marketId);

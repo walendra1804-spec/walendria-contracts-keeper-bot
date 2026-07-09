@@ -179,7 +179,9 @@ contract LiveChiadoLifecycleForkTest is Test {
         vm.prank(buyer);
         settlement.pay{value: P}(listingId, 0);
 
-        marketId = disputeManager.marketIdOf(listingId, 0);
+        // Freshly created listing's slot 0 is on its first-ever sale, so cycle is 1 (ListingManager's per-slot
+        // use counter, bumped on confirmPayment).
+        marketId = disputeManager.marketIdOf(listingId, 0, 1);
         vm.prank(buyer);
         disputeManager.fundGuiltySide{value: P / 2}(listingId, 0);
         assertTrue(_open(marketId), "market should open when guilty funding hits 0.5P");

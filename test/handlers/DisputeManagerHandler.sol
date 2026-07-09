@@ -116,7 +116,7 @@ contract DisputeManagerHandler is Test {
         if (listingId == type(uint256).max) return;
 
         (address seller,,,,,,) = lm.listings(listingId);
-        (,, address buyer) = lm.slots(listingId, 0);
+        (,, address buyer,) = lm.slots(listingId, 0);
         SpectralMarket.Side verdict = verdictSeed % 2 == 0 ? SpectralMarket.Side.Guilty : SpectralMarket.Side.Innocent;
 
         vm.prank(buyer);
@@ -129,7 +129,7 @@ contract DisputeManagerHandler is Test {
         uint256 listingId = _pickOpenUnresolvedListing(listingSeed);
         if (listingId == type(uint256).max) return;
 
-        uint256 marketId = dm.marketIdOf(listingId, 0);
+        uint256 marketId = _marketId(listingId);
         SpectralMarket.Side side = sideSeed % 2 == 0 ? SpectralMarket.Side.Guilty : SpectralMarket.Side.Innocent;
         vm.prank(priceController);
         try market.resolveMarket(marketId, side) {} catch {}
@@ -138,7 +138,7 @@ contract DisputeManagerHandler is Test {
     function finalizeDispute(uint256 listingSeed) external {
         if (listingIds.length == 0) return;
         uint256 listingId = listingIds[listingSeed % listingIds.length];
-        uint256 marketId = dm.marketIdOf(listingId, 0);
+        uint256 marketId = _marketId(listingId);
         (bool opened, bool finalized) = dm.disputes(marketId);
         if (!opened || finalized) return;
         (,,,,, bool resolved,) = market.markets(marketId);
@@ -159,6 +159,15 @@ contract DisputeManagerHandler is Test {
         return listingIds.length;
     }
 
+    /// @dev Every listing this handler creates gets exactly one confirmPayment, ever (createAndConfirmListing
+    ///      always mints a fresh listingId rather than reselling an existing one's slot 0), so its cycle is
+    ///      always 1 - reading it live rather than hardcoding keeps this handler correct even if that ever
+    ///      changes.
+    function _marketId(uint256 listingId) internal view returns (uint256) {
+        (,,, uint256 cycle) = lm.slots(listingId, 0);
+        return dm.marketIdOf(listingId, 0, cycle);
+    }
+
     /// @dev Returns the first listingId reachable from `seed` (wrapping) whose slot is PaymentConfirmed and whose
     ///      dispute has not yet opened, or type(uint256).max.
     function _pickFundableListing(uint256 seed) internal view returns (uint256) {
@@ -166,7 +175,7 @@ contract DisputeManagerHandler is Test {
         if (len == 0) return type(uint256).max;
         for (uint256 i = 0; i < len; i++) {
             uint256 candidate = listingIds[(seed + i) % len];
-            (ListingManager.SlotStatus status,,) = lm.slots(candidate, 0);
+            (ListingManager.SlotStatus status,,,) = lm.slots(candidate, 0);
             if (status == ListingManager.SlotStatus.PaymentConfirmed) return candidate;
         }
         return type(uint256).max;
@@ -179,7 +188,7 @@ contract DisputeManagerHandler is Test {
         if (len == 0) return type(uint256).max;
         for (uint256 i = 0; i < len; i++) {
             uint256 candidate = listingIds[(seed + i) % len];
-            uint256 marketId = dm.marketIdOf(candidate, 0);
+            uint256 marketId = _marketId(candidate);
             (,,,, bool open, bool resolved,) = market.markets(marketId);
             if (open && !resolved) return candidate;
         }
@@ -189,6 +198,6 @@ contract DisputeManagerHandler is Test {
     function _pickOpenUnresolvedMarket(uint256 seed) internal view returns (uint256) {
         uint256 listingId = _pickOpenUnresolvedListing(seed);
         if (listingId == type(uint256).max) return type(uint256).max;
-        return dm.marketIdOf(listingId, 0);
+        return _marketId(listingId);
     }
 }
