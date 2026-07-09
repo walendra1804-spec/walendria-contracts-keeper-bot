@@ -227,6 +227,46 @@ contract DisputeManagerTest is Test {
         assertEq(uint8(status), uint8(ListingManager.SlotStatus.Disputed));
     }
 
+    /// Regression for the live-testnet exploit: the buyer funds the Guilty side to open the dispute, then
+    /// immediately tries to sell the forced opening position straight back into the liquidity it just created,
+    /// pocketing a risk-free profit. Both sides' opening positions are locked until the case resolves (Section
+    /// 2.6.1), so every attempt reverts and nothing is extracted - reproduced here through the real
+    /// fundGuiltySide -> joint-injection -> SpectralMarket path, not a hand-opened market.
+    function test_ExploitRegression_OpeningFunderCannotDumpForcedPositionMidDispute() public {
+        uint256 listingId = _openConfirmedListing();
+        uint256 marketId = _marketId(listingId, 0);
+
+        vm.prank(buyer);
+        dm.fundGuiltySide{value: HALF_PRICE}(listingId, 0);
+
+        uint256 opening = HALF_PRICE * 2; // credited at 2x the 0.5P stake
+        assertEq(market.sharesOf(marketId, SpectralMarket.Side.Guilty, buyer), opening);
+        assertEq(
+            market.sellableSharesOf(marketId, SpectralMarket.Side.Guilty, buyer),
+            0,
+            "the whole opening position is locked liquidity"
+        );
+
+        uint256 balBefore = buyer.balance;
+
+        // Dump the whole position - reverts.
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.SharesLocked.selector, buyer, opening, 0, opening));
+        market.sell(marketId, SpectralMarket.Side.Guilty, opening, 0);
+
+        // Shave even 1 wei off it - still reverts.
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.SharesLocked.selector, buyer, 1, 0, opening));
+        market.sell(marketId, SpectralMarket.Side.Guilty, 1, 0);
+
+        assertEq(buyer.balance, balBefore, "no ez money: the funder extracted nothing from its own opening stake");
+
+        // The seller's forced Innocent position is locked identically (whitepaper 2.6.1: "Both positions").
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.SharesLocked.selector, seller, opening, 0, opening));
+        market.sell(marketId, SpectralMarket.Side.Innocent, opening, 0);
+    }
+
     function test_FundGuiltySideMultipleFundersCreditProportionally() public {
         uint256 listingId = _openConfirmedListing();
         uint256 marketId = _marketId(listingId, 0);

@@ -61,6 +61,20 @@ contract SpectralMarket is ReentrancyGuard {
     mapping(uint256 marketId => mapping(Side => mapping(address trader => uint256))) public sharesOf;
     mapping(address controller => bool) public isController;
 
+    /// @notice The portion of a holder's `sharesOf` balance that is *locked as market liquidity* and cannot be
+    ///         sold until the market resolves (Section 2.6.1, whitepaper: "Both positions are locked until the
+    ///         case resolves"). It is credited once, at {openMarket}, to each initial joint-injection funder -
+    ///         the Guilty-side backers and the seller - for the full initial position their 0.5P bought (twice
+    ///         their contribution, at the unbiased 0.5 opening price). {sell} may only ever dispose of a holder's
+    ///         balance *above* this floor: the initial 1P-per-side depth stays in the pool for the market's whole
+    ///         life, which is the "liquidity locked" property the whitepaper relies on (it is why a market can
+    ///         never be drained of its opening depth by the very parties that seeded it). Shares acquired
+    ///         afterward through {buy} are entirely free to {sell}; only the opening injection is locked. This is
+    ///         *never* decremented (locked shares are never sold), and it is irrelevant after resolution, when
+    ///         {redeem} pays out a holder's entire winning balance - locked or not - because the lock's only job
+    ///         was to hold liquidity in place *while the case was live*.
+    mapping(uint256 marketId => mapping(Side => mapping(address trader => uint256))) public lockedShares;
+
     /// @notice Count of distinct addresses that have EVER held a nonzero balance of `Side` in `marketId`, credited
     ///         once per address the first time it acquires a nonzero position and never decremented - selling
     ///         back to zero does not undo it. Together with a current-balance check, this is what lets
@@ -111,6 +125,7 @@ contract SpectralMarket is ReentrancyGuard {
     error BuySlippageExceeded(uint256 cost, uint256 maxCost);
     error SellSlippageExceeded(uint256 proceeds, uint256 minProceeds);
     error InsufficientShares(address trader, uint256 requested, uint256 held);
+    error SharesLocked(address trader, uint256 requested, uint256 sellable, uint256 locked);
     error NothingToRedeem(address trader);
     error TransferFailed(address to, uint256 amount);
     error DeveloperPoolNotSet();
@@ -242,6 +257,12 @@ contract SpectralMarket is ReentrancyGuard {
     /// @notice Sells `shares` of `side` in `marketId`, held by the caller. `minProceeds` is the caller's minimum
     ///         acceptable payment (slippage protection); actual proceeds are computed via
     ///         {LMSRMath-costOfTrade} with a negative share delta.
+    /// @dev Only the caller's *sellable* balance - their `sharesOf` above their {lockedShares} floor - may be
+    ///      sold: the initial joint-injection positions are locked as market liquidity until resolution (Section
+    ///      2.6.1). Without this, whoever seeded a side could open the market and immediately sell their forced
+    ///      opening position back to the very liquidity they just created, extracting a risk-free profit and
+    ///      draining the depth the dispute is supposed to keep in place - the exact exploit this guards against.
+    ///      Shares bought later via {buy} carry no lock and are freely sellable.
     function sell(uint256 marketId, Side side, uint256 shares, uint256 minProceeds)
         external
         nonReentrant
@@ -254,6 +275,13 @@ contract SpectralMarket is ReentrancyGuard {
 
         uint256 held = sharesOf[marketId][side][msg.sender];
         if (shares > held) revert InsufficientShares(msg.sender, shares, held);
+
+        // held >= locked always holds pre-resolution (locked is set once at open and never sold below), so the
+        // subtraction cannot underflow; the guarded form is kept purely so a future regression would surface as a
+        // clear SharesLocked revert rather than an opaque arithmetic panic.
+        uint256 locked = lockedShares[marketId][side][msg.sender];
+        uint256 sellable = held > locked ? held - locked : 0;
+        if (shares > sellable) revert SharesLocked(msg.sender, shares, sellable, locked);
 
         // casting to 'int256' is safe for the same reason as in {buy}: shares is bounded by `held`, itself a
         // wei-scale quantity.
@@ -393,6 +421,17 @@ contract SpectralMarket is ReentrancyGuard {
         return m.pooled > remainingObligation ? m.pooled - remainingObligation : 0;
     }
 
+    /// @notice How many of `trader`'s `side` shares in `marketId` are sellable right now: their `sharesOf`
+    ///         balance above their locked initial-position floor ({lockedShares}, Section 2.6.1). Returns zero
+    ///         for a holder whose whole balance is the locked opening injection. Exposed for the frontend to show
+    ///         "sellable vs. locked" without re-deriving the split, and so integrators don't have to know the
+    ///         locking rule to size a {sell} correctly.
+    function sellableSharesOf(uint256 marketId, Side side, address trader) external view returns (uint256) {
+        uint256 held = sharesOf[marketId][side][trader];
+        uint256 locked = lockedShares[marketId][side][trader];
+        return held > locked ? held - locked : 0;
+    }
+
     /// @notice Current marginal Guilty/Innocent price for `marketId` (Section 2.6.4), exposed for
     ///         SettlementConditions.sol (Phase 6) to check against the 87%/90% thresholds (Section 2.6.5).
     function currentPrice(uint256 marketId) external view returns (uint256 pGuilty, uint256 pInnocent) {
@@ -447,7 +486,11 @@ contract SpectralMarket is ReentrancyGuard {
     {
         for (uint256 i = 0; i < recipients.length; i++) {
             _markHolder(marketId, side, recipients[i]);
-            sharesOf[marketId][side][recipients[i]] += amounts[i] * 2;
+            // The whole initial position is locked liquidity (Section 2.6.1): credit it to both the spendable
+            // balance and the locked floor, so {sell} can never dispose of any of it until the market resolves.
+            uint256 credited = amounts[i] * 2;
+            sharesOf[marketId][side][recipients[i]] += credited;
+            lockedShares[marketId][side][recipients[i]] += credited;
         }
     }
 

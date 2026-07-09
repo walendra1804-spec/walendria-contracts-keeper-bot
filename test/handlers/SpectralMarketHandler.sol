@@ -83,9 +83,13 @@ contract SpectralMarketHandler is Test {
 
         address trader = traders[traderSeed % traders.length];
         SpectralMarket.Side side = sideSeed % 2 == 0 ? SpectralMarket.Side.Guilty : SpectralMarket.Side.Innocent;
-        uint256 held = market.sharesOf(marketId, side, trader);
-        if (held == 0) return;
-        uint256 shares = bound(sharesSeed, 1, held);
+        // Bound to the trader's *sellable* balance (held above the locked opening-injection floor, Section
+        // 2.6.1): the initial joint-injection positions are locked liquidity until resolution, so a sell that
+        // dips into them reverts by design. Bounding here keeps the handler exercising real, accepted sells
+        // rather than burning every call on a guaranteed SharesLocked revert.
+        uint256 sellable = market.sellableSharesOf(marketId, side, trader);
+        if (sellable == 0) return;
+        uint256 shares = bound(sharesSeed, 1, sellable);
 
         vm.prank(trader);
         try market.sell(marketId, side, shares, 0) {} catch {}

@@ -370,8 +370,13 @@ contract SpectralMarketTest is Test {
 
     function test_SellRevertsOnSlippageExceeded() public {
         _openSimpleMarket(1);
-        vm.prank(guilty1);
-        vm.expectRevert();
+        // Buy first so the caller has *unlocked* shares to sell: guilty1's opening position is locked liquidity
+        // (Section 2.6.1) and would revert with SharesLocked, masking the slippage path this test targets.
+        vm.prank(stranger);
+        market.buy{value: 1 ether}(1, SpectralMarket.Side.Guilty, 0.2 ether);
+
+        vm.prank(stranger);
+        vm.expectRevert(); // SellSlippageExceeded(proceeds, minProceeds) - proceeds computed dynamically
         market.sell(1, SpectralMarket.Side.Guilty, 0.1 ether, type(uint256).max);
     }
 
@@ -383,6 +388,212 @@ contract SpectralMarketTest is Test {
         vm.prank(guilty1);
         vm.expectRevert(abi.encodeWithSelector(SpectralMarket.MarketAlreadyResolved.selector, 1));
         market.sell(1, SpectralMarket.Side.Guilty, 0.1 ether, 0);
+    }
+
+    // ── liquidity lock (Section 2.6.1: initial positions locked until resolution) ─────────────────────────────────
+
+    /// The exact exploit reported: the address that seeds a side opens the market and immediately tries to sell
+    /// the forced opening position it was just credited, trying to extract a risk-free profit from the very
+    /// liquidity it created. The whole opening position (P shares at the 0.5 price, from a 0.5P stake) is locked,
+    /// so selling any of it - even 1 wei - reverts, and the funder's balance is untouched.
+    function test_OpeningFunderCannotSellAnyOfTheirLockedGuiltyPosition() public {
+        _openSimpleMarket(1);
+        assertEq(market.sharesOf(1, SpectralMarket.Side.Guilty, guilty1), P, "funder holds the full opening position");
+        assertEq(market.lockedShares(1, SpectralMarket.Side.Guilty, guilty1), P, "all of it is locked");
+        assertEq(market.sellableSharesOf(1, SpectralMarket.Side.Guilty, guilty1), 0, "none of it is sellable");
+
+        uint256 balanceBefore = guilty1.balance;
+
+        // Try to sell 1 wei of it.
+        vm.prank(guilty1);
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.SharesLocked.selector, guilty1, 1, 0, P));
+        market.sell(1, SpectralMarket.Side.Guilty, 1, 0);
+
+        // Try to dump the whole position.
+        vm.prank(guilty1);
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.SharesLocked.selector, guilty1, P, 0, P));
+        market.sell(1, SpectralMarket.Side.Guilty, P, 0);
+
+        assertEq(guilty1.balance, balanceBefore, "no ez money: the funder extracted nothing");
+        assertEq(market.sharesOf(1, SpectralMarket.Side.Guilty, guilty1), P, "position intact");
+    }
+
+    /// The lock is symmetric (whitepaper 2.6.1: "Both positions are locked"): the seller's forced 0.5P Innocent
+    /// position is just as unsellable as the Guilty funder's.
+    function test_SellerCannotSellAnyOfTheirLockedInnocentPosition() public {
+        _openSimpleMarket(1);
+        assertEq(market.sellableSharesOf(1, SpectralMarket.Side.Innocent, seller), 0);
+
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.SharesLocked.selector, seller, P, 0, P));
+        market.sell(1, SpectralMarket.Side.Innocent, P, 0);
+    }
+
+    /// Shares bought *after* opening carry no lock and are freely sellable - but an immediate round trip is
+    /// exactly a wash (no free profit), and once the bought portion is sold the holder is back to a fully-locked
+    /// position they still cannot dip below.
+    function test_FunderCanSellOnlyWhatTheyBoughtBeyondTheLockAndRoundTripNetsZero() public {
+        _openSimpleMarket(1);
+
+        vm.prank(guilty1);
+        uint256 cost = market.buy{value: 10 ether}(1, SpectralMarket.Side.Guilty, 0.3 ether);
+
+        assertEq(market.sharesOf(1, SpectralMarket.Side.Guilty, guilty1), P + 0.3 ether, "locked P + bought 0.3");
+        assertEq(market.sellableSharesOf(1, SpectralMarket.Side.Guilty, guilty1), 0.3 ether, "only the bought part");
+
+        // Selling more than the bought portion (dipping into the locked P) reverts.
+        vm.prank(guilty1);
+        vm.expectRevert(
+            abi.encodeWithSelector(SpectralMarket.SharesLocked.selector, guilty1, 0.3 ether + 1, 0.3 ether, P)
+        );
+        market.sell(1, SpectralMarket.Side.Guilty, 0.3 ether + 1, 0);
+
+        // Selling exactly the bought portion is fine and, with no intervening trades, exactly refunds the cost.
+        uint256 balBefore = guilty1.balance;
+        vm.prank(guilty1);
+        uint256 proceeds = market.sell(1, SpectralMarket.Side.Guilty, 0.3 ether, 0);
+        assertEq(proceeds, cost, "buy-then-sell round trip is a wash, not a profit");
+        assertEq(guilty1.balance - balBefore, proceeds);
+
+        // Back to a fully-locked position.
+        assertEq(market.sharesOf(1, SpectralMarket.Side.Guilty, guilty1), P);
+        assertEq(market.sellableSharesOf(1, SpectralMarket.Side.Guilty, guilty1), 0);
+        vm.prank(guilty1);
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.SharesLocked.selector, guilty1, 1, 0, P));
+        market.sell(1, SpectralMarket.Side.Guilty, 1, 0);
+    }
+
+    /// The lock only governs *selling while the case is live*. Once resolved, a winning funder redeems their
+    /// entire position - locked portion included - exactly as before (the lock's only job was to hold liquidity
+    /// in place during trading).
+    function test_LockedPositionStillRedeemsInFullAfterResolution() public {
+        _openSimpleMarket(1);
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        uint256 before = guilty1.balance;
+        vm.prank(guilty1);
+        uint256 payout = market.redeem(1);
+        assertEq(payout, P, "the locked opening position redeems in full once the case is over");
+        assertEq(guilty1.balance - before, P);
+    }
+
+    /// sellableSharesOf tracks the held-minus-locked floor across a buy/sell sequence.
+    function test_SellableSharesOfTracksTheLockedFloor() public {
+        _openSimpleMarket(1);
+        assertEq(market.sellableSharesOf(1, SpectralMarket.Side.Guilty, guilty1), 0);
+
+        vm.prank(guilty1);
+        market.buy{value: 10 ether}(1, SpectralMarket.Side.Guilty, 0.5 ether);
+        assertEq(market.sellableSharesOf(1, SpectralMarket.Side.Guilty, guilty1), 0.5 ether);
+
+        vm.prank(guilty1);
+        market.sell(1, SpectralMarket.Side.Guilty, 0.2 ether, 0);
+        assertEq(market.sellableSharesOf(1, SpectralMarket.Side.Guilty, guilty1), 0.3 ether);
+    }
+
+    /// At any market scale, the pure opening position (before the funder buys anything more) is entirely locked -
+    /// not one wei of it is ever sellable.
+    function testFuzz_OpeningPositionIsNeverSellableAtAnyScale(uint256 halfPSeed, uint256 sellSeed) public {
+        uint256 halfP = bound(halfPSeed, 1e9, 100 ether);
+        uint256 b = halfP * 2;
+
+        vm.deal(controller, halfP * 2 + 1);
+        vm.prank(controller);
+        market.openMarket{value: halfP * 2}(
+            7, b, _singleton(guilty1), _singletonAmt(halfP), _singleton(seller), _singletonAmt(halfP)
+        );
+
+        uint256 opening = halfP * 2; // credited at 2x the stake
+        assertEq(market.sharesOf(7, SpectralMarket.Side.Guilty, guilty1), opening);
+        assertEq(market.sellableSharesOf(7, SpectralMarket.Side.Guilty, guilty1), 0);
+
+        uint256 toSell = bound(sellSeed, 1, opening);
+        vm.prank(guilty1);
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.SharesLocked.selector, guilty1, toSell, 0, opening));
+        market.sell(7, SpectralMarket.Side.Guilty, toSell, 0);
+    }
+
+    /// After buying an arbitrary extra amount, a funder can sell up to exactly that amount and never a wei more:
+    /// their locked opening floor is inviolable regardless of how much they layer on top.
+    function testFuzz_CannotSellBeyondBoughtIntoTheLockedFloor(uint256 buySeed) public {
+        _openSimpleMarket(1);
+        uint256 bought = bound(buySeed, 1e9, 5 ether); // within PRBMath's exp() domain for b = 1 ether
+
+        vm.deal(guilty1, 1000 ether);
+        vm.prank(guilty1);
+        market.buy{value: 1000 ether}(1, SpectralMarket.Side.Guilty, bought);
+
+        assertEq(market.sellableSharesOf(1, SpectralMarket.Side.Guilty, guilty1), bought);
+
+        // One wei past the bought amount dips into the locked P and must revert.
+        vm.prank(guilty1);
+        vm.expectRevert(abi.encodeWithSelector(SpectralMarket.SharesLocked.selector, guilty1, bought + 1, bought, P));
+        market.sell(1, SpectralMarket.Side.Guilty, bought + 1, 0);
+
+        // Exactly the bought amount is allowed.
+        vm.prank(guilty1);
+        market.sell(1, SpectralMarket.Side.Guilty, bought, 0);
+        assertEq(market.sellableSharesOf(1, SpectralMarket.Side.Guilty, guilty1), 0);
+    }
+
+    /// Stress: many funders on the Guilty side plus outside traders churning buys and sells over a long sequence.
+    /// Throughout, no participant is ever able to sell below their locked opening floor, the per-side outstanding
+    /// total never drops below the sum of locked positions, and the pool keeps its opening depth.
+    function test_Stress_LockHoldsThroughLongMixedTradingSequence() public {
+        // Three Guilty funders split the 0.5P opening stake; seller takes the Innocent side.
+        address g3 = makeAddr("guilty3");
+        vm.deal(g3, 1000 ether);
+        address[] memory funders = new address[](3);
+        funders[0] = guilty1;
+        funders[1] = guilty2;
+        funders[2] = g3;
+        uint256[] memory amounts = new uint256[](3);
+        amounts[0] = 0.2 ether;
+        amounts[1] = 0.2 ether;
+        amounts[2] = 0.1 ether; // sums to HALF_P
+        vm.prank(controller);
+        market.openMarket{value: P}(9, B, funders, amounts, _singleton(seller), _singletonAmt(HALF_P));
+
+        uint256 lockedG1 = market.lockedShares(9, SpectralMarket.Side.Guilty, guilty1);
+        uint256 lockedSeller = market.lockedShares(9, SpectralMarket.Side.Innocent, seller);
+        assertEq(lockedG1, 0.4 ether, "0.2P stake => 0.4 shares locked");
+        assertEq(lockedSeller, P, "seller's full 0.5P => P shares locked");
+
+        // A churn of outside trades interleaved with funders trying (and failing) to shed their locked positions.
+        for (uint256 i = 0; i < 8; i++) {
+            vm.prank(stranger);
+            market.buy{value: 100 ether}(
+                9, i % 2 == 0 ? SpectralMarket.Side.Guilty : SpectralMarket.Side.Innocent, 0.05 ether
+            );
+
+            // stranger's bought shares are freely sellable
+            uint256 strangerSellable = market.sellableSharesOf(
+                9, i % 2 == 0 ? SpectralMarket.Side.Guilty : SpectralMarket.Side.Innocent, stranger
+            );
+            if (strangerSellable > 0) {
+                vm.prank(stranger);
+                market.sell(
+                    9, i % 2 == 0 ? SpectralMarket.Side.Guilty : SpectralMarket.Side.Innocent, strangerSellable / 2, 0
+                );
+            }
+
+            // every funder's locked floor is still untouchable
+            vm.prank(guilty1);
+            vm.expectRevert();
+            market.sell(9, SpectralMarket.Side.Guilty, lockedG1, 0);
+            vm.prank(seller);
+            vm.expectRevert();
+            market.sell(9, SpectralMarket.Side.Innocent, lockedSeller, 0);
+        }
+
+        // The opening liquidity is provably still in the pool: each side's q is at least the locked total.
+        (, SD59x18 qG, SD59x18 qI,,,,) = market.markets(9);
+        uint256 lockedGuiltyTotal = market.lockedShares(9, SpectralMarket.Side.Guilty, guilty1)
+            + market.lockedShares(9, SpectralMarket.Side.Guilty, guilty2)
+            + market.lockedShares(9, SpectralMarket.Side.Guilty, g3);
+        assertGe(uint256(SD59x18.unwrap(qG)), lockedGuiltyTotal, "Guilty opening depth still locked in the pool");
+        assertGe(uint256(SD59x18.unwrap(qI)), lockedSeller, "Innocent opening depth still locked in the pool");
     }
 
     // ── resolveMarket ──────────────────────────────────────────────────────────────────────────────────────────

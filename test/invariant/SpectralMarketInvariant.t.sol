@@ -63,6 +63,42 @@ contract SpectralMarketInvariantTest is Test {
         }
     }
 
+    /// @notice The "liquidity locked" property (Section 2.6.1): the initial joint-injection positions can never
+    ///         be sold, so before resolution every holder's balance stays at or above their locked floor, and
+    ///         each side's total outstanding shares stay at or above the sum of all locked positions on that
+    ///         side - the opening 1P-per-side depth is always still in the pool. Were {sell} ever to let an
+    ///         opening funder dispose of even part of their forced position (the exploit this guards), one of
+    ///         these would break. After resolution the lock stops mattering ({redeem} pays out locked and
+    ///         unlocked winning shares alike), so this is only asserted while the market is live.
+    function invariant_LockedInitialPositionsNeverLeaveThePool() public view {
+        uint256 marketCount = handler.marketIdsCount();
+        for (uint256 m = 0; m < marketCount; m++) {
+            uint256 marketId = handler.marketIds(m);
+            (, SD59x18 qGuilty, SD59x18 qInnocent,,, bool resolved,) = market.markets(marketId);
+            if (resolved) continue;
+
+            uint256 lockedGuilty;
+            uint256 lockedInnocent;
+            uint256 participantCount = handler.participantsCount(marketId);
+            for (uint256 p = 0; p < participantCount; p++) {
+                address participant = handler.participantsOf(marketId, p);
+                uint256 heldGuilty = market.sharesOf(marketId, SpectralMarket.Side.Guilty, participant);
+                uint256 lockG = market.lockedShares(marketId, SpectralMarket.Side.Guilty, participant);
+                uint256 heldInnocent = market.sharesOf(marketId, SpectralMarket.Side.Innocent, participant);
+                uint256 lockI = market.lockedShares(marketId, SpectralMarket.Side.Innocent, participant);
+                assertGe(heldGuilty, lockG, "a holder can never sell below their locked Guilty floor");
+                assertGe(heldInnocent, lockI, "a holder can never sell below their locked Innocent floor");
+                lockedGuilty += lockG;
+                lockedInnocent += lockI;
+            }
+
+            assertGe(uint256(SD59x18.unwrap(qGuilty)), lockedGuilty, "qGuilty must never drop below locked liquidity");
+            assertGe(
+                uint256(SD59x18.unwrap(qInnocent)), lockedInnocent, "qInnocent must never drop below locked liquidity"
+            );
+        }
+    }
+
     /// @notice The contract must always hold at least as much native currency as it is tracked as owing across
     ///         every market's `pooled` accounting - the same solvency-register-vs-actual-balance property
     ///         SharedIB's `totalPooled` guards against, extended to a contract that pools funds per-market rather
