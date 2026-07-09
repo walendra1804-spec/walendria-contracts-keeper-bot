@@ -33,14 +33,14 @@ import {DisputeManager} from "../../src/DisputeManager.sol";
 contract LiveChiadoLifecycleForkTest is Test {
     // Live Chiado addresses (checksummed) from broadcast/Deploy.s.sol/10200/run-latest.json - the same set wired
     // into walendria-app/src/lib/contracts.ts and keeper-bot/src/config.js.
-    IntegrityBond internal constant integrityBond = IntegrityBond(0xCe6d6c0911D4203Bb4842e72922c438B166f50b9);
-    ListingManager internal constant listingManager = ListingManager(0xd7082ae2aBcE68a9DB5A22A6489afE1fbac50111);
-    Settlement internal constant settlement = Settlement(0x28b3d7F41fCEB9FC290a3742cACd324aC4C86092);
-    SpectralMarket internal constant spectralMarket = SpectralMarket(0xF2FAcf7443e506BDE3987395a87B9Dec8748027A);
+    IntegrityBond internal constant integrityBond = IntegrityBond(0x71fFAd99B5E5871F944f9525b44C8d4598F28e6D);
+    ListingManager internal constant listingManager = ListingManager(0xEA53f63Ab55bF408783F20d8A0B50c89F23F5546);
+    Settlement internal constant settlement = Settlement(0xa7Bd77A6D2D00C76d83Ff8D062e5072BBAdB008A);
+    SpectralMarket internal constant spectralMarket = SpectralMarket(0x80B4bf7D5B9A638f11396Ba22c922d8C42Cc6f18);
     SettlementConditions internal constant settlementConditions =
-        SettlementConditions(0x36F49e11858dE2834F360473009BE80E55160Ccb);
+        SettlementConditions(0xE71a192F22E30502BeAf7Ef9Aa33EB62F59cCef9);
     DisputeManager internal constant disputeManager =
-        DisputeManager(payable(0x6c5A731167F1b44cd0822d07a002B492bfb57E07));
+        DisputeManager(payable(0x5CC6eB104c5967DB2DFCDcba9306D7075C56A7e4));
 
     uint256 internal constant P = 1_000_000; // wei - the same tiny scale prior live testing used on this deployment
     uint256 internal constant COMPLETION_WINDOW = 72 hours; // ListingManager.MIN_COMPLETION_WINDOW, exercised exactly
