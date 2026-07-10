@@ -30,6 +30,10 @@ contract ReentrantFunder {
         dm.fundGuiltySide{value: value}(listingId, slotIndex);
     }
 
+    function attackReclaim(uint256 listingId, uint256 slotIndex, uint256 cycle) external {
+        dm.reclaimGuiltyFunding(listingId, slotIndex, cycle);
+    }
+
     receive() external payable {
         if (!reentered && reentryCalldata.length > 0) {
             reentered = true;
@@ -470,6 +474,236 @@ contract DisputeManagerTest is Test {
 
         assertTrue(attacker.reentered());
         assertFalse(attacker.reentrySucceeded(), "reentrant fundGuiltySide should have been blocked");
+    }
+
+    // ── reclaimGuiltyFunding: below-threshold funding is locked, then reclaimable, never lost ─────────────────────
+
+    function _cycleOf(uint256 listingId, uint256 slotIndex) internal view returns (uint256 cycle) {
+        (,,, cycle) = lm.slots(listingId, slotIndex);
+    }
+
+    /// @dev The exact scenario from the live bug report: a buyer funds part of the 0.5P threshold, the window
+    ///      passes without anyone reaching it, and the contribution must come back in full rather than being
+    ///      stranded. Here the slot is still PaymentConfirmed (nobody finalized it), reclaimable purely because
+    ///      the deadline elapsed.
+    function test_ReclaimAfterWindowExpiryRefundsPartialContribution() public {
+        uint256 listingId = _openConfirmedListing();
+        uint256 marketId = _marketId(listingId, 0);
+        uint256 cycle = _cycleOf(listingId, 0);
+        uint256 contribution = (HALF_PRICE * 3) / 10; // 0.3P, below the 0.5P threshold
+
+        vm.prank(buyer);
+        dm.fundGuiltySide{value: contribution}(listingId, 0);
+        assertEq(address(dm).balance, contribution, "dm holds the accepted contribution before reclaim");
+
+        vm.warp(block.timestamp + WINDOW + 1);
+        assertEq(dm.guiltyFundingReclaimable(listingId, 0, cycle, buyer), contribution);
+
+        uint256 buyerBefore = buyer.balance;
+        vm.expectEmit(true, true, false, true, address(dm));
+        emit DisputeManager.GuiltyFundingReclaimed(marketId, buyer, contribution);
+        vm.prank(buyer);
+        dm.reclaimGuiltyFunding(listingId, 0, cycle);
+
+        assertEq(buyer.balance - buyerBefore, contribution, "buyer gets back exactly what they funded");
+        assertEq(dm.guiltyContributionOf(marketId, buyer), 0, "contribution zeroed");
+        assertEq(dm.guiltyFundingTotal(marketId), 0, "total drained");
+        assertEq(address(dm).balance, 0, "no funder money left stranded in the contract");
+    }
+
+    /// @dev After the window expires and someone permissionlessly recycles the slot to Empty, the cycle is
+    ///      unchanged, so the funder reclaims against that same cycle.
+    function test_ReclaimAfterFinalizeExpiredSlotRecycled() public {
+        uint256 listingId = _openConfirmedListing();
+        uint256 cycle = _cycleOf(listingId, 0);
+        uint256 contribution = HALF_PRICE / 5;
+
+        vm.prank(backer1);
+        dm.fundGuiltySide{value: contribution}(listingId, 0);
+
+        vm.warp(block.timestamp + WINDOW + 1);
+        lm.finalizeExpiredSlot(listingId, 0);
+
+        (ListingManager.SlotStatus status,,, uint256 liveCycle) = lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Empty));
+        assertEq(liveCycle, cycle, "finalizeExpiredSlot does not bump the cycle");
+
+        uint256 before = backer1.balance;
+        vm.prank(backer1);
+        dm.reclaimGuiltyFunding(listingId, 0, cycle);
+        assertEq(backer1.balance - before, contribution);
+    }
+
+    /// @dev The buyer confirming completion early (before threshold) also closes the funding window: the slot
+    ///      leaves PaymentConfirmed, so any partial backer can reclaim.
+    function test_ReclaimAfterConfirmCompletionRecycled() public {
+        uint256 listingId = _openConfirmedListing();
+        uint256 cycle = _cycleOf(listingId, 0);
+        uint256 contribution = HALF_PRICE / 3;
+
+        vm.prank(backer1);
+        dm.fundGuiltySide{value: contribution}(listingId, 0);
+
+        vm.prank(buyer);
+        lm.confirmCompletion(listingId, 0); // slot -> Empty before the threshold was ever reached
+
+        uint256 before = backer1.balance;
+        vm.prank(backer1);
+        dm.reclaimGuiltyFunding(listingId, 0, cycle);
+        assertEq(backer1.balance - before, contribution);
+    }
+
+    /// @dev The hardest case: the slot recycles AND is resold, so the live cycle advances past the one the
+    ///      funding was recorded under. Passing the explicit original cycle still reclaims it, and the new
+    ///      cycle's funding pot is completely independent.
+    function test_ReclaimSurvivesResaleUnderNewCycle() public {
+        uint256 listingId = _openConfirmedListing();
+        uint256 firstCycle = _cycleOf(listingId, 0);
+        uint256 contribution = HALF_PRICE / 4;
+
+        vm.prank(backer1);
+        dm.fundGuiltySide{value: contribution}(listingId, 0);
+
+        vm.warp(block.timestamp + WINDOW + 1);
+        lm.finalizeExpiredSlot(listingId, 0);
+        vm.prank(settlementStandIn);
+        lm.confirmPayment(listingId, 0, buyer); // resale bumps the cycle
+        uint256 secondCycle = _cycleOf(listingId, 0);
+        assertEq(secondCycle, firstCycle + 1, "resale bumps the cycle");
+
+        assertEq(dm.guiltyFundingReclaimable(listingId, 0, firstCycle, backer1), contribution);
+        uint256 before = backer1.balance;
+        vm.prank(backer1);
+        dm.reclaimGuiltyFunding(listingId, 0, firstCycle);
+        assertEq(backer1.balance - before, contribution);
+
+        assertEq(dm.guiltyFundingReclaimable(listingId, 0, secondCycle, backer1), 0, "new cycle is a separate pot");
+    }
+
+    /// @dev While the funding window is still genuinely open (threshold could still be reached), reclaim must be
+    ///      refused - otherwise a funder could pull out mid-race and desync a threshold crossing.
+    function test_ReclaimRevertsWhileFundingWindowStillOpen() public {
+        uint256 listingId = _openConfirmedListing();
+        uint256 cycle = _cycleOf(listingId, 0);
+
+        vm.prank(buyer);
+        dm.fundGuiltySide{value: HALF_PRICE / 4}(listingId, 0);
+
+        assertEq(dm.guiltyFundingReclaimable(listingId, 0, cycle, buyer), 0, "not reclaimable while window open");
+        vm.expectRevert(abi.encodeWithSelector(DisputeManager.FundingWindowStillOpen.selector, listingId, 0));
+        vm.prank(buyer);
+        dm.reclaimGuiltyFunding(listingId, 0, cycle);
+    }
+
+    /// @dev Once the dispute opens, the funding became locked initial Guilty shares (Section 2.6.1) redeemed at
+    ///      resolution - it is not native currency to hand back here.
+    function test_ReclaimRevertsAfterDisputeOpened() public {
+        (uint256 listingId, uint256 marketId) = _openSoleBuyerFundedDispute();
+        uint256 cycle = _cycleOf(listingId, 0);
+
+        assertEq(dm.guiltyFundingReclaimable(listingId, 0, cycle, buyer), 0);
+        vm.expectRevert(abi.encodeWithSelector(DisputeManager.DisputeAlreadyOpened.selector, marketId));
+        vm.prank(buyer);
+        dm.reclaimGuiltyFunding(listingId, 0, cycle);
+    }
+
+    function test_ReclaimRevertsForNonContributorAndOnDoubleReclaim() public {
+        uint256 listingId = _openConfirmedListing();
+        uint256 cycle = _cycleOf(listingId, 0);
+        uint256 marketId = _marketId(listingId, 0);
+
+        vm.prank(buyer);
+        dm.fundGuiltySide{value: HALF_PRICE / 4}(listingId, 0);
+        vm.warp(block.timestamp + WINDOW + 1);
+
+        vm.expectRevert(abi.encodeWithSelector(DisputeManager.NothingToReclaim.selector, marketId, stranger));
+        vm.prank(stranger);
+        dm.reclaimGuiltyFunding(listingId, 0, cycle);
+
+        vm.prank(buyer);
+        dm.reclaimGuiltyFunding(listingId, 0, cycle);
+        vm.expectRevert(abi.encodeWithSelector(DisputeManager.NothingToReclaim.selector, marketId, buyer));
+        vm.prank(buyer);
+        dm.reclaimGuiltyFunding(listingId, 0, cycle);
+    }
+
+    /// @dev Two backers, each below-threshold together (0.3P + 0.1P = 0.4P), reclaim independently: one reclaim
+    ///      drains only that funder's share and never touches the other's.
+    function test_ReclaimMultiFunderIndependence() public {
+        uint256 listingId = _openConfirmedListing();
+        uint256 cycle = _cycleOf(listingId, 0);
+        uint256 marketId = _marketId(listingId, 0);
+        uint256 c1 = (HALF_PRICE * 3) / 10; // 0.3P
+        uint256 c2 = HALF_PRICE / 10; // 0.1P (total 0.4P < 0.5P: never opens)
+
+        vm.prank(backer1);
+        dm.fundGuiltySide{value: c1}(listingId, 0);
+        vm.prank(backer2);
+        dm.fundGuiltySide{value: c2}(listingId, 0);
+        assertEq(dm.guiltyFundingTotal(marketId), c1 + c2);
+
+        vm.warp(block.timestamp + WINDOW + 1);
+
+        uint256 b1 = backer1.balance;
+        vm.prank(backer1);
+        dm.reclaimGuiltyFunding(listingId, 0, cycle);
+        assertEq(backer1.balance - b1, c1);
+        assertEq(dm.guiltyFundingTotal(marketId), c2, "only backer1's share drained; backer2 untouched");
+        assertEq(dm.guiltyFundingReclaimable(listingId, 0, cycle, backer2), c2);
+
+        uint256 b2 = backer2.balance;
+        vm.prank(backer2);
+        dm.reclaimGuiltyFunding(listingId, 0, cycle);
+        assertEq(backer2.balance - b2, c2);
+        assertEq(dm.guiltyFundingTotal(marketId), 0);
+        assertEq(address(dm).balance, 0);
+    }
+
+    /// @dev Reentering reclaim from the refund callback is blocked by nonReentrant; the outer reclaim still
+    ///      succeeds exactly once and strands nothing.
+    function test_ReentrantFunderCannotReenterReclaimDuringRefund() public {
+        uint256 listingId = _openConfirmedListing();
+        ReentrantFunder attacker = new ReentrantFunder(dm);
+        vm.deal(address(attacker), 10 ether);
+        uint256 cycle = _cycleOf(listingId, 0);
+
+        attacker.attackFund(listingId, 0, HALF_PRICE / 4); // partial fund, no refund callback yet
+        vm.warp(block.timestamp + WINDOW + 1);
+
+        attacker.setReentryCalldata(
+            abi.encodeWithSelector(DisputeManager.reclaimGuiltyFunding.selector, listingId, uint256(0), cycle)
+        );
+        attacker.attackReclaim(listingId, 0, cycle);
+
+        assertTrue(attacker.reentered());
+        assertFalse(attacker.reentrySucceeded(), "reentrant reclaim should have been blocked");
+        assertEq(address(dm).balance, 0, "outer reclaim still paid out exactly once");
+        assertEq(dm.guiltyContributionOf(dm.marketIdOf(listingId, 0, cycle), address(attacker)), 0);
+    }
+
+    function test_ReclaimableViewIsSafeToPollForNonexistentListing() public view {
+        assertEq(dm.guiltyFundingReclaimable(999, 0, 1, buyer), 0);
+    }
+
+    /// @dev At any below-threshold scale, a reclaim returns exactly the contribution and conserves ETH end-to-end.
+    function testFuzz_ReclaimReturnsExactlyContributedAndConservesEth(uint256 contribution) public {
+        contribution = bound(contribution, 1, HALF_PRICE - 1); // strictly below threshold: never opens
+        uint256 listingId = _openConfirmedListing();
+        uint256 cycle = _cycleOf(listingId, 0);
+        uint256 marketId = _marketId(listingId, 0);
+
+        vm.prank(backer1);
+        dm.fundGuiltySide{value: contribution}(listingId, 0);
+        assertEq(address(dm).balance, contribution);
+
+        vm.warp(block.timestamp + WINDOW + 1);
+
+        uint256 before = backer1.balance;
+        vm.prank(backer1);
+        dm.reclaimGuiltyFunding(listingId, 0, cycle);
+        assertEq(backer1.balance - before, contribution, "exact refund at any scale below threshold");
+        assertEq(dm.guiltyFundingTotal(marketId), 0);
+        assertEq(address(dm).balance, 0);
     }
 
     // ── mutualClose ────────────────────────────────────────────────────────────────────────────────────────────

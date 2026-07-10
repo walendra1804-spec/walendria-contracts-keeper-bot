@@ -7,7 +7,7 @@ import {SpectralMarket} from "./SpectralMarket.sol";
 import {ISettlementConditionsHook} from "./ISettlementConditionsHook.sol";
 
 /// @title SettlementConditions
-/// @notice The settlement condition and checkpoint-and-poke mechanism for Walendria Protocol "The 27" (Section
+/// @notice The settlement condition and checkpoint-and-poke mechanism for Walendria Protocol "The 28" (Section
 ///         2.6.5, 2.6.8). One instance tracks every market opened on a single, fixed SpectralMarket.
 ///
 ///         A cumulative (stopwatch-style) timer tracks total time either side's price has spent at or above 93% -

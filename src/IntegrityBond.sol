@@ -4,7 +4,7 @@ pragma solidity ^0.8.26;
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title IntegrityBond
-/// @notice Direct Integrity Bond accounting for Walendria Protocol "The 27" (Section 2.1): sellers deposit native
+/// @notice Direct Integrity Bond accounting for Walendria Protocol "The 28" (Section 2.1): sellers deposit native
 ///         currency as a fraud bond, a portion of which gets locked while backing an active listing or open
 ///         dispute (Section 2.5), and can only be removed from a seller's bond via an authorized slash.
 /// @dev Phase 2 of the build strategy: this contract owns only the generic lock/unlock/slash accounting

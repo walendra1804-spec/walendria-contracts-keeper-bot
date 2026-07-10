@@ -978,6 +978,25 @@ contract SpectralMarketSurplusTest is Test {
         assertEq(payout, 1 ether, "the winning side's redemption is unaffected by the surplus sweep");
     }
 
+    /// @notice surplusOf is a read-only mirror of exactly what a sweep would move: zero before resolution,
+    ///         equal to the sweepable amount after, and back to zero once swept - never reverting.
+    function test_SurplusOfMirrorsWhatSweepWouldTransfer() public {
+        vm.prank(loser);
+        uint256 cost = market.buy{value: 1 ether}(1, SpectralMarket.Side.Innocent, 0.3 ether);
+
+        assertEq(market.surplusOf(1), 0, "an unresolved market reports no sweepable surplus");
+
+        vm.prank(controller);
+        market.resolveMarket(1, SpectralMarket.Side.Guilty);
+
+        uint256 previewed = market.surplusOf(1);
+        assertEq(previewed, cost, "surplusOf mirrors the sweepable amount after resolution");
+
+        uint256 swept = market.sweepSurplus(1);
+        assertEq(swept, previewed, "sweep transfers exactly the previewed amount");
+        assertEq(market.surplusOf(1), 0, "nothing left to preview after the sweep");
+    }
+
     // ── payResolutionBounty (the 0.1% poke bounty, drawn from the same surplus) ───────────────────────────────
 
     /// @notice A successful poke's bounty is paid from the same surplus a sweep would otherwise collect: the

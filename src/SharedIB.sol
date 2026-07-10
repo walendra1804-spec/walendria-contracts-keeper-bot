@@ -6,12 +6,24 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @title SharedIB
-/// @notice Shared Integrity Bond pool for Walendria Protocol "The 27" (Section 2.2): external depositors stake
+/// @notice Shared Integrity Bond pool for Walendria Protocol "The 28" (Section 2.2): external depositors stake
 ///         native currency into a common pool and receive ERC20 pool shares representing their proportional
 ///         claim; sellers who cannot afford a full direct bond rent locked-capital backing from the pool instead.
 /// @dev Phase 2 of the build strategy, built and tested standalone like IntegrityBond.sol - no notion of
 ///      "listing" or "dispute" lives here, only the pool/lock/slash accounting primitives that ListingManager.sol
 ///      and DisputeManager.sol (later phases) will orchestrate as authorized `controller`s.
+///
+///      DEPLOYMENT STATUS - not yet wired into the live protocol. On the current deployment this pool exists but
+///      no protocol contract is a `controller` of it (its only controller is the deployer, set purely so it can
+///      be exercised manually on testnet - see Deploy.s.sol). ListingManager locks direct IntegrityBond ONLY and
+///      has no code path that calls this pool's {lock}/{slash}/{unlock} on a seller's behalf, because the
+///      consent question the whitepaper's Section 2.2 leaves open - *how* a pool chooses which seller(s) it
+///      backs - has no implementation yet (see ListingManager's and DisputeManager's Phase-3/Phase-7 scope
+///      notes). So the cold-start-capital mechanism Section 2.2 describes is specified and deployed but NOT
+///      operational on this deployment: depositing here today is idle capital, not seller backing. The
+///      whitepaper's Section 2.2 carries a matching disclosure. Wiring this in is deferred future work, and is
+///      the point at which Section 2.6.10's Shared-IB restriction on {DisputeManager-mutualClose} stops being
+///      structurally vacuous and needs the real runtime check DisputeManager marks the location for.
 ///
 ///      Design choices carried over from IntegrityBond.sol for consistency: `controller`s are a fixed allowlist
 ///      set once at construction (Section 2.8 immutability), and `slash` credits a pull-payment ledger rather

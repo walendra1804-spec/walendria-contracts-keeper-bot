@@ -8,13 +8,16 @@ import {IntegrityBond} from "./IntegrityBond.sol";
 import {SpectralMarket} from "./SpectralMarket.sol";
 
 /// @title DisputeManager
-/// @notice Wires Settlement, IntegrityBond, and SpectralMarket together for Walendria Protocol "The 27" (Section
+/// @notice Wires Settlement, IntegrityBond, and SpectralMarket together for Walendria Protocol "The 28" (Section
 ///         2.4, 2.6.1, 3.1, 3.2, 2.6.10): accepts pre-market "Seller Guilty" funding toward the 0.5P threshold from
 ///         any address, triggers the joint initial-position injection the instant that threshold is crossed
 ///         (drawing a matching 0.5P from the seller's Locked IB), and - once a market resolves, by whatever means
 ///         (price threshold via SettlementConditions, a poke, or mutual agreement) - applies the dispute's final
 ///         IB consequence (1.0P restitution slash on Guilty, or a 1.0P unlock on Innocent) and tells
-///         ListingManager the slot is permanently spent.
+///         ListingManager the slot is permanently spent. Partial Guilty-side funding that never crosses 0.5P
+///         before its funding window closes (the slot expires, is confirmed complete, or is resold under a new
+///         cycle) is not consumed into any market and is reclaimable dollar-for-dollar by each contributor via
+///         {reclaimGuiltyFunding} - it is never stranded in this contract.
 /// @dev Phase 7 of the build strategy - the module the build strategy itself flags as where "most of the
 ///      project's real complexity concentrates." A dispute is identified by {marketIdOf}, a deterministic hash of
 ///      (listingId, slotIndex, cycle) - the same value doubles as the SpectralMarket `marketId`, so no separate ID
@@ -80,6 +83,7 @@ contract DisputeManager is ReentrancyGuard {
     );
     event MutualCloseProposed(uint256 indexed marketId, address indexed proposer, SpectralMarket.Side verdict);
     event DisputeFinalized(uint256 indexed marketId, SpectralMarket.Side winningSide, uint256 remainingLocked);
+    event GuiltyFundingReclaimed(uint256 indexed marketId, address indexed funder, uint256 amount);
 
     error ZeroAmount();
     error ListingNotFound(uint256 listingId);
@@ -95,6 +99,10 @@ contract DisputeManager is ReentrancyGuard {
     error MarketNotResolvedYet(uint256 marketId);
     error NotPartyToDispute(address caller, address buyer, address seller);
     error ThirdPartyParticipation(uint256 marketId, SpectralMarket.Side side);
+    error DisputeAlreadyOpened(uint256 marketId);
+    error FundingWindowStillOpen(uint256 listingId, uint256 slotIndex);
+    error NothingToReclaim(uint256 marketId, address funder);
+    error ReclaimTransferFailed(address to, uint256 amount);
 
     constructor(ListingManager _listingManager, IntegrityBond _integrityBond, SpectralMarket _spectralMarket) {
         listingManager = _listingManager;
@@ -154,6 +162,57 @@ contract DisputeManager is ReentrancyGuard {
         if (gf.total == halfPrice) {
             _openDispute(listingId, slotIndex, marketId, seller, price, halfPrice);
         }
+    }
+
+    /// @notice Refunds a contributor their full recorded {fundGuiltySide} contribution for the dispute at
+    ///         `(listingId, slotIndex, cycle)` when that funding never opened a market and never can. Accepting
+    ///         Guilty-side funding only ever opens a market while the slot is still PaymentConfirmed at that same
+    ///         `cycle` and before its completion deadline; the instant that funding window closes with the 0.5P
+    ///         threshold unmet, the accumulated contributions are inert - not shares, not a market, just native
+    ///         currency sitting in this contract - and each contributor can pull their own share back here. This is
+    ///         the counterpart the pre-market funding path was missing: below-threshold funding is *locked* only
+    ///         until the window resolves, exactly like the initiating positions are (Section 2.6.1), never *lost*.
+    /// @dev `cycle` is taken explicitly (not read live from ListingManager) so a contribution stays reclaimable
+    ///      even after the slot has recycled to Empty and been resold under a *later* cycle - at which point the
+    ///      live cycle no longer matches the one this funding was recorded against. The three-part window-closed
+    ///      test below is deliberately exhaustive over how a fundable cycle can end without opening:
+    ///        - the slot advanced past this cycle (recycled + resold; live cycle > this one), or
+    ///        - the slot left PaymentConfirmed at this cycle (finalizeExpiredSlot/confirmCompletion -> Empty, or a
+    ///          dispute for a *different* reason is impossible here since {disputes[marketId].opened} is checked
+    ///          first), or
+    ///        - the completion deadline elapsed while still PaymentConfirmed (fundGuiltySide itself already reverts
+    ///          WindowExpired past this point, so no open can race a reclaim).
+    ///      In every one of those states {fundGuiltySide} can no longer add to nor open this marketId, so draining
+    ///      `contributionOf`/`total` here can never desync a market that later opens. Checks-effects-interactions +
+    ///      nonReentrant: state is zeroed before the refund call, and a failed refund reverts the whole reclaim.
+    function reclaimGuiltyFunding(uint256 listingId, uint256 slotIndex, uint256 cycle) external nonReentrant {
+        uint256 marketId = marketIdOf(listingId, slotIndex, cycle);
+
+        // If the dispute ever opened for this cycle, the contributions became locked initial Guilty-side shares
+        // (Section 2.6.1) and are redeemed/forfeited at resolution via SpectralMarket, never reclaimed here.
+        if (disputes[marketId].opened) revert DisputeAlreadyOpened(marketId);
+
+        (address seller,, uint256 totalSlots,,,,) = listingManager.listings(listingId);
+        if (seller == address(0)) revert ListingNotFound(listingId);
+        if (slotIndex >= totalSlots) revert SlotIndexOutOfRange(slotIndex, totalSlots);
+
+        (ListingManager.SlotStatus status, uint256 completionDeadline,, uint256 liveCycle) =
+            listingManager.slots(listingId, slotIndex);
+        bool windowClosed = liveCycle != cycle || status != ListingManager.SlotStatus.PaymentConfirmed
+            || block.timestamp >= completionDeadline;
+        if (!windowClosed) revert FundingWindowStillOpen(listingId, slotIndex);
+
+        GuiltyFunding storage gf = _guiltyFunding[marketId];
+        uint256 amount = gf.contributionOf[msg.sender];
+        if (amount == 0) revert NothingToReclaim(marketId, msg.sender);
+
+        gf.contributionOf[msg.sender] = 0;
+        gf.total -= amount;
+
+        emit GuiltyFundingReclaimed(marketId, msg.sender, amount);
+
+        (bool ok,) = msg.sender.call{value: amount}("");
+        if (!ok) revert ReclaimTransferFailed(msg.sender, amount);
     }
 
     /// @notice Buyer and seller each call this specifying the same `verdict` to resolve their dispute immediately
@@ -243,6 +302,31 @@ contract DisputeManager is ReentrancyGuard {
     }
 
     function guiltyContributionOf(uint256 marketId, address funder) external view returns (uint256) {
+        return _guiltyFunding[marketId].contributionOf[funder];
+    }
+
+    /// @notice How much `funder` can reclaim right now for the dispute at `(listingId, slotIndex, cycle)` via
+    ///         {reclaimGuiltyFunding}: their recorded contribution if that funding window has definitively closed
+    ///         without opening a market, otherwise 0. A convenience mirror of {reclaimGuiltyFunding}'s own guards
+    ///         so a UI can show a live "reclaim X" affordance without simulating the call. Returns 0 - never
+    ///         reverts - for a nonexistent listing/slot, so it is safe to poll speculatively.
+    function guiltyFundingReclaimable(uint256 listingId, uint256 slotIndex, uint256 cycle, address funder)
+        external
+        view
+        returns (uint256)
+    {
+        uint256 marketId = marketIdOf(listingId, slotIndex, cycle);
+        if (disputes[marketId].opened) return 0;
+
+        (address seller,, uint256 totalSlots,,,,) = listingManager.listings(listingId);
+        if (seller == address(0) || slotIndex >= totalSlots) return 0;
+
+        (ListingManager.SlotStatus status, uint256 completionDeadline,, uint256 liveCycle) =
+            listingManager.slots(listingId, slotIndex);
+        bool windowClosed = liveCycle != cycle || status != ListingManager.SlotStatus.PaymentConfirmed
+            || block.timestamp >= completionDeadline;
+        if (!windowClosed) return 0;
+
         return _guiltyFunding[marketId].contributionOf[funder];
     }
 

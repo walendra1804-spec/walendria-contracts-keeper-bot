@@ -5,7 +5,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IntegrityBond} from "./IntegrityBond.sol";
 
 /// @title ListingManager
-/// @notice Listing lifecycle for Walendria Protocol "The 27" (Section 2.5): a seller creates a listing for a
+/// @notice Listing lifecycle for Walendria Protocol "The 28" (Section 2.5): a seller creates a listing for a
 ///         transaction of price P supporting N simultaneous slots, locking 1.5*P*N of Integrity Bond immediately
 ///         - before any buyer appears. Each slot independently tracks payment confirmation and its completion
 ///         window (a seller-configurable duration, floored at a 72-hour protocol minimum), after which it

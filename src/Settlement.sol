@@ -5,7 +5,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {ListingManager} from "./ListingManager.sol";
 
 /// @title Settlement
-/// @notice Atomic buyer payment for Walendria Protocol "The 27" (Section 2.3): a buyer pays into this contract,
+/// @notice Atomic buyer payment for Walendria Protocol "The 28" (Section 2.3): a buyer pays into this contract,
 ///         not directly to the seller, and in one call the contract verifies the amount received is at least
 ///         the listing's price, refunds any excess, deducts the 0.5% Developer Fee, forwards the remainder to
 ///         the seller, and confirms the slot with ListingManager - which starts its completion window and makes

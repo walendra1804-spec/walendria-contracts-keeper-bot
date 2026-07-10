@@ -5,7 +5,7 @@ import {SD59x18, UNIT} from "prb-math/SD59x18.sol";
 
 /// @title LMSRMath
 /// @notice Fixed-point cost and price functions for the Logarithmic Market Scoring Rule bonding curve that powers
-///         the Spectral Market (Walendria Protocol "The 27", Section 2.6.4).
+///         the Spectral Market (Walendria Protocol "The 28", Section 2.6.4).
 /// @dev All exponentiation and logarithm evaluation is delegated to PRBMath's audited SD59x18 `exp`/`ln`
 ///      (see lib/prb-math). This library performs no hand-rolled exp/ln of its own, per the build strategy's
 ///      highest-priority risk-reduction decision for this project.

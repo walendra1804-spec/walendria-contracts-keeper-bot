@@ -7,7 +7,7 @@ import {LMSRMath} from "./LMSRMath.sol";
 import {ISettlementConditionsHook} from "./ISettlementConditionsHook.sol";
 
 /// @title SpectralMarket
-/// @notice The Spectral Market for Walendria Protocol "The 27" (Section 2.6): a purpose-built LMSR prediction
+/// @notice The Spectral Market for Walendria Protocol "The 28" (Section 2.6): a purpose-built LMSR prediction
 ///         market, one instance per dispute, keyed by `marketId`. Each market is opened with a joint initial
 ///         position injection (Section 2.6.1), then trades freely (Section 2.6.3) until an authorized controller
 ///         resolves it, after which winning-side shares redeem for up to $1 each (Section 2.6.3), capped at
@@ -153,16 +153,17 @@ contract SpectralMarket is ReentrancyGuard {
     /// @notice Opens `marketId` with liquidity parameter `b` (Section 2.6.4; locked parameter: b = 1 * P per
     ///         disputed transaction) and performs the joint initial-position injection (Section 2.6.1):
     ///         `guiltyFunders`/`guiltyAmounts` are credited Guilty shares in proportion to their contribution,
-    ///         `innocentRecipients`/`innocentAmounts` are credited Innocent shares the same way - ordinarily just
-    ///         the seller (the matching 0.5P IB draw), but Phase 8 also lets DeveloperPool.sol appear on *both*
-    ///         arrays simultaneously when Section 2.6.7's liquidity buffer tops up a small-P dispute. All
+    ///         `innocentRecipients`/`innocentAmounts` are credited Innocent shares the same way - always exactly
+    ///         one recipient, the seller, funding the matching 0.5P IB draw (the Protocol Liquidity Buffer that
+    ///         once also credited DeveloperPool.sol on both arrays to top a small-P dispute up to a depth floor
+    ///         has been retired, whitepaper Section 2.6.7, so no such extra recipient can appear any more). All
     ///         contributions are resolved as a single simultaneous state transition from (0, 0), so the market
     ///         opens at an unbiased 50/50 price regardless of the order the underlying contributions landed in
     ///         (Section 2.6.4's path independence).
     ///
     ///         Requires `sum(guiltyAmounts) == sum(innocentAmounts)` (Section 2.4: the seller's match is always
-    ///         equal to the Guilty-side funding that triggered it; a buffer top-up preserves this by contributing
-    ///         the identical amount to both arrays). Given that precondition, moving symmetrically from (0, 0) to
+    ///         exactly equal to the Guilty-side funding that triggered it). Given that precondition, moving
+    ///         symmetrically from (0, 0) to
     ///         (q, q) costs exactly `q` regardless of `b` - see {LMSRMath-cost}: C(q,q) - C(0,0) =
     ///         b*ln(2*e^(q/b)) - b*ln(2) = q. So every contributor's shares are simply twice their dollar
     ///         contribution (the unbiased opening price is exactly 0.5): no LMSRMath call is needed to *solve*
@@ -407,6 +408,17 @@ contract SpectralMarket is ReentrancyGuard {
         if (!ok) revert TransferFailed(developerPool, surplus);
     }
 
+    /// @notice The surplus currently sweepable to the Developer Pool for `marketId` via {sweepSurplus} - a
+    ///         read-only mirror of exactly what that call would transfer right now, so a UI can preview the
+    ///         amount without simulating the state-changing call. Returns 0 (never reverts) for an unopened or
+    ///         unresolved market, or a resolved one whose winners' outstanding claim still meets or exceeds the
+    ///         pool (the common quiet-dispute case), so it is safe to poll speculatively.
+    function surplusOf(uint256 marketId) external view returns (uint256) {
+        Market storage m = markets[marketId];
+        if (!m.resolved) return 0;
+        return _currentSurplus(m, marketId);
+    }
+
     /// @dev The surplus available for `marketId` right now: pooled funds minus the still-outstanding winning-side
     ///      obligation (winning shares issued, less what has already been redeemed). Zero when the winners' claim
     ///      still meets or exceeds the pool - the common case for a quiet dispute. Shared by {sweepSurplus} and
@@ -433,7 +445,8 @@ contract SpectralMarket is ReentrancyGuard {
     }
 
     /// @notice Current marginal Guilty/Innocent price for `marketId` (Section 2.6.4), exposed for
-    ///         SettlementConditions.sol (Phase 6) to check against the 87%/90% thresholds (Section 2.6.5).
+    ///         SettlementConditions.sol (Phase 6) to check against the single 93% resolution threshold
+    ///         (Section 2.6.5).
     function currentPrice(uint256 marketId) external view returns (uint256 pGuilty, uint256 pInnocent) {
         Market storage m = markets[marketId];
         if (!m.open) revert MarketNotOpen(marketId);
