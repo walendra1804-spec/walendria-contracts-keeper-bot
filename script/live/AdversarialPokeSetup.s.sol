@@ -39,7 +39,7 @@ contract AdversarialPokeSetupScript is Script {
 
         vm.startBroadcast(sellerKey);
         integrityBond.deposit{value: (P * 3) / 2}();
-        uint256 listingId = listingManager.createListing(P, 1, COMPLETION_WINDOW);
+        uint256 listingId = listingManager.createListing(P, 1, COMPLETION_WINDOW, "", "");
         vm.stopBroadcast();
         console.log("Listing created:", listingId);
 

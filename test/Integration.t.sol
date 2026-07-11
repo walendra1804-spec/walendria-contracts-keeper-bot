@@ -85,7 +85,7 @@ contract IntegrationTest is Test {
         vm.prank(seller);
         bond.deposit{value: 3 ether}();
         vm.prank(seller);
-        uint256 listingId = lm.createListing(price, 1, WINDOW);
+        uint256 listingId = lm.createListing(price, 1, WINDOW, "", "");
 
         uint256 sellerBefore = seller.balance;
         vm.prank(buyer);
@@ -312,7 +312,7 @@ contract IntegrationTest is Test {
         vm.prank(seller);
         bond.deposit{value: (price * 3 + 1)}();
         vm.prank(seller);
-        listingId = lm.createListing(price, 1, WINDOW);
+        listingId = lm.createListing(price, 1, WINDOW, "", "");
         vm.prank(buyer);
         settlement.pay{value: price}(listingId, 0);
     }

@@ -79,12 +79,30 @@ contract ListingManager {
         uint256 cycle; // bumped on every confirmPayment; disambiguates repeat uses of the same slot index
     }
 
+    /// @notice Optional, seller-supplied title and description for a listing, both stored on-chain and immutable
+    ///         once the listing is created (there is no setter - a seller who wants different text creates a new
+    ///         listing). Like on-chain evidence (Section 2.6.2), this text is a permanent, tamper-proof record: it
+    ///         is the canonical description of what the seller offered, and is therefore the primary reference for
+    ///         adjudicating any later dispute over whether that offer was fulfilled. Empty strings mean the seller
+    ///         chose not to describe the listing; nothing here is required.
+    struct ListingMetadata {
+        string title;
+        string description;
+    }
+
     /// @notice Protocol-enforced floor (Section 2.5, 2.9): no listing may offer a shorter completion window.
     uint256 public constant MIN_COMPLETION_WINDOW = 72 hours;
 
     /// @dev Sanity cap on N so a seller's own {reduceSlots}/{closeListing} scan can never approach a block gas
     ///      limit - self-inflicted only, but bounding it keeps worst-case gas analyzable for audit.
     uint256 public constant MAX_SLOTS = 1000;
+
+    /// @dev Byte-length ceilings on the optional listing title/description, bounding the storage/gas a single
+    ///      createListing can consume (a seller pays for their own text, but a fixed cap keeps worst-case cost
+    ///      analyzable and blocks griefing via absurdly large strings). Byte length, not character count, so
+    ///      multi-byte UTF-8 is measured by what it actually costs to store.
+    uint256 public constant MAX_LISTING_TITLE_BYTES = 200;
+    uint256 public constant MAX_LISTING_DESCRIPTION_BYTES = 2000;
 
     IntegrityBond public immutable integrityBond;
 
@@ -98,6 +116,7 @@ contract ListingManager {
     mapping(address controller => bool) public isController;
     mapping(uint256 listingId => Listing) public listings;
     mapping(uint256 listingId => mapping(uint256 slotIndex => Slot)) public slots;
+    mapping(uint256 listingId => ListingMetadata) public listingMetadata;
     uint256 public nextListingId;
 
     event ListingCreated(
@@ -108,6 +127,9 @@ contract ListingManager {
         uint256 completionWindow,
         uint256 perSlotLocked
     );
+    /// @dev Emitted only when a seller supplied a non-empty title and/or description at creation. Carries the
+    ///      full text (not a hash) so the on-chain log is itself the canonical, complete record.
+    event ListingDescribed(uint256 indexed listingId, string title, string description);
     event SlotPaymentConfirmed(
         uint256 indexed listingId,
         uint256 indexed slotIndex,
@@ -133,6 +155,8 @@ contract ListingManager {
     error PriceExceedsCap(uint256 price, uint256 cap);
     error ZeroSlots();
     error TooManySlots(uint256 requested, uint256 max);
+    error ListingTitleTooLong(uint256 length, uint256 max);
+    error ListingDescriptionTooLong(uint256 length, uint256 max);
     error CompletionWindowTooShort(uint256 requested, uint256 minimum);
     error SlotIndexOutOfRange(uint256 slotIndex, uint256 totalSlots);
     error SlotNotEmpty(uint256 listingId, uint256 slotIndex);
@@ -165,16 +189,29 @@ contract ListingManager {
     /// @notice Creates a listing for a transaction of `price`, supporting `totalSlots` simultaneous slots, each
     ///         requiring a completion window of at least `MIN_COMPLETION_WINDOW`. Locks `1.5 * price * totalSlots`
     ///         of the caller's direct Integrity Bond immediately (Section 2.5) - before any buyer appears.
-    function createListing(uint256 price, uint256 totalSlots, uint256 completionWindow)
-        external
-        returns (uint256 listingId)
-    {
+    /// @param title Optional listing title, stored on-chain (empty string to omit). Capped at
+    ///        {MAX_LISTING_TITLE_BYTES} bytes. Immutable once set - see {ListingMetadata}.
+    /// @param description Optional listing description, stored on-chain (empty string to omit). Capped at
+    ///        {MAX_LISTING_DESCRIPTION_BYTES} bytes. Immutable once set - see {ListingMetadata}.
+    function createListing(
+        uint256 price,
+        uint256 totalSlots,
+        uint256 completionWindow,
+        string calldata title,
+        string calldata description
+    ) external returns (uint256 listingId) {
         if (price == 0) revert ZeroPrice();
         if (price > maxTransactionValue) revert PriceExceedsCap(price, maxTransactionValue);
         if (totalSlots == 0) revert ZeroSlots();
         if (totalSlots > MAX_SLOTS) revert TooManySlots(totalSlots, MAX_SLOTS);
         if (completionWindow < MIN_COMPLETION_WINDOW) {
             revert CompletionWindowTooShort(completionWindow, MIN_COMPLETION_WINDOW);
+        }
+        if (bytes(title).length > MAX_LISTING_TITLE_BYTES) {
+            revert ListingTitleTooLong(bytes(title).length, MAX_LISTING_TITLE_BYTES);
+        }
+        if (bytes(description).length > MAX_LISTING_DESCRIPTION_BYTES) {
+            revert ListingDescriptionTooLong(bytes(description).length, MAX_LISTING_DESCRIPTION_BYTES);
         }
 
         uint256 perSlotLocked = Math.ceilDiv(price * 3, 2);
@@ -192,6 +229,13 @@ contract ListingManager {
         });
 
         emit ListingCreated(listingId, msg.sender, price, totalSlots, completionWindow, perSlotLocked);
+
+        // Only persist/emit metadata when the seller actually supplied some, so the common no-description path
+        // costs nothing extra beyond the two length checks above.
+        if (bytes(title).length > 0 || bytes(description).length > 0) {
+            listingMetadata[listingId] = ListingMetadata({title: title, description: description});
+            emit ListingDescribed(listingId, title, description);
+        }
     }
 
     /// @notice Marks `slotIndex` as paid, starting its completion-window clock, and records `buyer` as this cycle's

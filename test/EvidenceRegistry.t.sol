@@ -46,7 +46,7 @@ contract EvidenceRegistryTest is Test {
         bond.deposit{value: 100 ether}();
 
         vm.prank(seller);
-        listingId = lm.createListing(PRICE, SLOTS, WINDOW);
+        listingId = lm.createListing(PRICE, SLOTS, WINDOW, "", "");
     }
 
     function _confirmSlot0ForBuyer() internal {
@@ -176,7 +176,7 @@ contract EvidenceRegistryTest is Test {
         vm.prank(seller2);
         bond.deposit{value: 100 ether}();
         vm.prank(seller2);
-        uint256 listingId2 = lm.createListing(PRICE, SLOTS, WINDOW);
+        uint256 listingId2 = lm.createListing(PRICE, SLOTS, WINDOW, "", "");
         // listingId2's slot 0 has no confirmed buyer - `buyer` from the other listing must not be treated as a
         // party to this unrelated listing just because they hold that role elsewhere.
 
@@ -191,7 +191,7 @@ contract EvidenceRegistryTest is Test {
         vm.prank(seller2);
         bond.deposit{value: 100 ether}();
         vm.prank(seller2);
-        lm.createListing(PRICE, SLOTS, WINDOW);
+        lm.createListing(PRICE, SLOTS, WINDOW, "", "");
 
         vm.prank(seller2);
         vm.expectRevert(abi.encodeWithSelector(EvidenceRegistry.NotBuyerOrSeller.selector, listingId, 0, seller2));

@@ -62,7 +62,7 @@ contract RevertingReceiver {
         returns (uint256)
     {
         bond.deposit{value: msg.value}();
-        return lm.createListing(price, totalSlots, window);
+        return lm.createListing(price, totalSlots, window, "", "");
     }
 
     receive() external payable {
@@ -139,7 +139,7 @@ contract DisputeManagerTest is Test {
     ///      `buyer` as the buyer of record, returning the listingId. slotIndex is always 0.
     function _openConfirmedListing() internal returns (uint256 listingId) {
         vm.prank(seller);
-        listingId = lm.createListing(PRICE, 1, WINDOW);
+        listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
 
         vm.prank(settlementStandIn);
         lm.confirmPayment(listingId, 0, buyer);
@@ -324,7 +324,7 @@ contract DisputeManagerTest is Test {
 
     function test_FundGuiltySideRevertsWhenSlotNeverPaid() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
 
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(DisputeManager.SlotNotDisputable.selector, listingId, 0));
@@ -369,7 +369,7 @@ contract DisputeManagerTest is Test {
 
     function test_FundGuiltySideRevertsWhenPriceTooSmallToDispute() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(1, 1, WINDOW); // price = 1 wei -> halfPrice = 0
+        uint256 listingId = lm.createListing(1, 1, WINDOW, "", ""); // price = 1 wei -> halfPrice = 0
         vm.prank(settlementStandIn);
         lm.confirmPayment(listingId, 0, buyer);
 
@@ -1029,7 +1029,7 @@ contract DisputeManagerTest is Test {
         bond.deposit{value: perSlotLocked}();
 
         vm.prank(freshSeller);
-        uint256 listingId = lm.createListing(price, 1, WINDOW);
+        uint256 listingId = lm.createListing(price, 1, WINDOW, "", "");
         vm.prank(settlementStandIn);
         lm.confirmPayment(listingId, 0, buyer);
 
@@ -1072,7 +1072,7 @@ contract DisputeManagerTest is Test {
     function test_FinalizeDisputeSucceedsEvenWhenBuyerRefusesEth() public {
         RevertingReceiver badBuyer = new RevertingReceiver(bond, lm);
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(settlementStandIn);
         lm.confirmPayment(listingId, 0, address(badBuyer));
 

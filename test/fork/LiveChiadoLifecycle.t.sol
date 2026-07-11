@@ -173,7 +173,7 @@ contract LiveChiadoLifecycleForkTest is Test {
 
         vm.startPrank(seller);
         integrityBond.deposit{value: 3 * P}(); // free IB must cover createListing's 1.5P lock, with headroom
-        listingId = listingManager.createListing(P, 1, COMPLETION_WINDOW);
+        listingId = listingManager.createListing(P, 1, COMPLETION_WINDOW, "", "");
         vm.stopPrank();
 
         vm.prank(buyer);

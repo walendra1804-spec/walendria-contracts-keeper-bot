@@ -74,7 +74,7 @@ contract AdversarialInvariantsScript is Script {
     function _createListing(uint256 sellerKey) internal returns (uint256 listingId) {
         vm.startBroadcast(sellerKey);
         integrityBond.deposit{value: (P * 3) / 2}();
-        listingId = listingManager.createListing(P, 1, COMPLETION_WINDOW);
+        listingId = listingManager.createListing(P, 1, COMPLETION_WINDOW, "", "");
         vm.stopBroadcast();
         console.log("Listing created:", listingId);
     }

@@ -37,7 +37,7 @@ contract ListingManagerHandler is Test {
         if (bond.freeIB(seller) < required) return;
 
         vm.prank(seller);
-        uint256 listingId = lm.createListing(price, totalSlots, window);
+        uint256 listingId = lm.createListing(price, totalSlots, window, "", "");
         listingIds.push(listingId);
     }
 

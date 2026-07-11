@@ -25,7 +25,7 @@ contract RevertingSeller {
         returns (uint256)
     {
         bond.deposit{value: msg.value}();
-        return lm.createListing(price, totalSlots, window);
+        return lm.createListing(price, totalSlots, window, "", "");
     }
 
     receive() external payable {
@@ -105,7 +105,7 @@ contract SettlementTest is Test {
         bond.deposit{value: 100 ether}();
 
         vm.prank(seller);
-        listingId = lm.createListing(PRICE, SLOTS, WINDOW);
+        listingId = lm.createListing(PRICE, SLOTS, WINDOW, "", "");
 
         vm.deal(buyer, 1000 ether);
     }
@@ -270,7 +270,7 @@ contract SettlementTest is Test {
         vm.prank(seller);
         bond.deposit{value: required}();
         vm.prank(seller);
-        uint256 freshListingId = lm.createListing(price, 1, WINDOW);
+        uint256 freshListingId = lm.createListing(price, 1, WINDOW, "", "");
 
         address fuzzBuyer = makeAddr(string.concat("fuzzBuyer", vm.toString(priceSeed), vm.toString(overpaySeed)));
         vm.deal(fuzzBuyer, price + overpay);
@@ -322,7 +322,7 @@ contract SettlementTest is Test {
         vm.prank(seller);
         bond.deposit{value: required}();
         vm.prank(seller);
-        uint256 freshListingId = lm.createListing(price, 1, WINDOW);
+        uint256 freshListingId = lm.createListing(price, 1, WINDOW, "", "");
 
         uint256 sent = price - shortfall;
         address fuzzBuyer = makeAddr(string.concat("fuzzUnderpay", vm.toString(priceSeed), vm.toString(shortfallSeed)));

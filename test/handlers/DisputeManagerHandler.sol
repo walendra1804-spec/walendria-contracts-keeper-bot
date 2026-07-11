@@ -65,7 +65,7 @@ contract DisputeManagerHandler is Test {
         // in ListingManager.t.sol's own test comments).
         uint256 window = lm.MIN_COMPLETION_WINDOW();
         vm.prank(seller);
-        uint256 listingId = lm.createListing(price, 1, window);
+        uint256 listingId = lm.createListing(price, 1, window, "", "");
 
         address buyer = traders[buyerSeed % traders.length];
         vm.prank(settlementStandIn);

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {IntegrityBond} from "../src/IntegrityBond.sol";
 import {ListingManager} from "../src/ListingManager.sol";
 
@@ -16,6 +17,8 @@ contract ListingManagerTest is Test {
     uint256 internal constant PRICE = 1 ether;
     uint256 internal constant PER_SLOT_LOCKED = 1.5 ether;
     uint256 internal constant WINDOW = 72 hours;
+
+    event ListingDescribed(uint256 indexed listingId, string title, string description);
 
     function setUp() public {
         // IntegrityBond needs ListingManager's address (as its controller) and ListingManager needs
@@ -71,7 +74,7 @@ contract ListingManagerTest is Test {
         // The cap check fires before any IB is locked, so no funded bond is needed to observe the revert.
         vm.prank(seller);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.PriceExceedsCap.selector, cap + 1, cap));
-        capped.createListing(cap + 1, 1, WINDOW);
+        capped.createListing(cap + 1, 1, WINDOW, "", "");
     }
 
     function test_CreateListingSucceedsAtExactlyTheHardcap() public {
@@ -82,7 +85,7 @@ contract ListingManagerTest is Test {
         vm.prank(seller);
         cappedBond.deposit{value: 20 ether}(); // covers 1.5 * cap
         vm.prank(seller);
-        uint256 listingId = capped.createListing(cap, 1, WINDOW); // exactly at the cap is allowed
+        uint256 listingId = capped.createListing(cap, 1, WINDOW, "", ""); // exactly at the cap is allowed
 
         (, uint256 price,,,,,) = capped.listings(listingId);
         assertEq(price, cap, "a listing priced exactly at the cap must be accepted");
@@ -92,7 +95,7 @@ contract ListingManagerTest is Test {
 
     function test_CreateListingLocksOnePointFiveTimesPriceTimesSlots() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 3, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 3, WINDOW, "", "");
 
         (
             address s,
@@ -118,21 +121,110 @@ contract ListingManagerTest is Test {
         // price = 1 wei -> 1.5 wei is not representable; must round UP to 2 wei so the bond is never under
         // the true 1.5P requirement (rounding down would silently under-collateralize the seller).
         vm.prank(seller);
-        uint256 listingId = lm.createListing(1, 1, WINDOW);
+        uint256 listingId = lm.createListing(1, 1, WINDOW, "", "");
         (,,,,, uint256 perSlotLocked,) = lm.listings(listingId);
         assertEq(perSlotLocked, 2);
+    }
+
+    // ── Optional on-chain listing metadata: title + description (Section 2.6.2-style permanent record) ────────────
+
+    function test_CreateListingStoresTitleAndDescriptionOnChain() public {
+        string memory title = "Handmade oak desk";
+        string memory desc = "Solid oak, 120x60cm, dispatched within 3 days of payment confirmation.";
+
+        vm.expectEmit(true, false, false, true, address(lm));
+        emit ListingDescribed(0, title, desc);
+
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, title, desc);
+
+        (string memory storedTitle, string memory storedDesc) = lm.listingMetadata(listingId);
+        assertEq(storedTitle, title, "title must be persisted verbatim on-chain");
+        assertEq(storedDesc, desc, "description must be persisted verbatim on-chain");
+    }
+
+    function test_CreateListingWithEmptyMetadataStoresNothingAndEmitsNoDescribeEvent() public {
+        vm.recordLogs();
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+
+        (string memory storedTitle, string memory storedDesc) = lm.listingMetadata(listingId);
+        assertEq(bytes(storedTitle).length, 0, "no title stored on the empty path");
+        assertEq(bytes(storedDesc).length, 0, "no description stored on the empty path");
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 describedTopic = keccak256("ListingDescribed(uint256,string,string)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(logs[i].topics[0] != describedTopic, "empty metadata must emit no ListingDescribed event");
+        }
+    }
+
+    function test_CreateListingAllowsTitleOrDescriptionAlone() public {
+        vm.prank(seller);
+        uint256 idTitleOnly = lm.createListing(PRICE, 1, WINDOW, "Just a title", "");
+        (string memory t1, string memory d1) = lm.listingMetadata(idTitleOnly);
+        assertEq(t1, "Just a title");
+        assertEq(bytes(d1).length, 0);
+
+        vm.prank(seller);
+        uint256 idDescOnly = lm.createListing(PRICE, 1, WINDOW, "", "Only a description");
+        (string memory t2, string memory d2) = lm.listingMetadata(idDescOnly);
+        assertEq(bytes(t2).length, 0);
+        assertEq(d2, "Only a description");
+    }
+
+    function test_CreateListingAcceptsMetadataAtExactlyMaxLength() public {
+        string memory maxTitle = string(new bytes(lm.MAX_LISTING_TITLE_BYTES()));
+        string memory maxDesc = string(new bytes(lm.MAX_LISTING_DESCRIPTION_BYTES()));
+
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, maxTitle, maxDesc);
+
+        (string memory t, string memory d) = lm.listingMetadata(listingId);
+        assertEq(bytes(t).length, lm.MAX_LISTING_TITLE_BYTES(), "title at exactly the cap must be accepted");
+        assertEq(bytes(d).length, lm.MAX_LISTING_DESCRIPTION_BYTES(), "description at exactly the cap must be accepted");
+    }
+
+    function test_CreateListingRevertsWhenTitleExceedsMax() public {
+        uint256 max = lm.MAX_LISTING_TITLE_BYTES();
+        string memory tooLong = string(new bytes(max + 1));
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.ListingTitleTooLong.selector, max + 1, max));
+        lm.createListing(PRICE, 1, WINDOW, tooLong, "");
+    }
+
+    function test_CreateListingRevertsWhenDescriptionExceedsMax() public {
+        uint256 max = lm.MAX_LISTING_DESCRIPTION_BYTES();
+        string memory tooLong = string(new bytes(max + 1));
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.ListingDescriptionTooLong.selector, max + 1, max));
+        lm.createListing(PRICE, 1, WINDOW, "", tooLong);
+    }
+
+    function test_ListingMetadataIsIndependentAcrossListings() public {
+        vm.startPrank(seller);
+        uint256 a = lm.createListing(PRICE, 1, WINDOW, "Listing A", "desc A");
+        uint256 b = lm.createListing(PRICE, 1, WINDOW, "Listing B", "desc B");
+        vm.stopPrank();
+
+        (string memory ta, string memory da) = lm.listingMetadata(a);
+        (string memory tb, string memory db) = lm.listingMetadata(b);
+        assertEq(ta, "Listing A");
+        assertEq(da, "desc A");
+        assertEq(tb, "Listing B");
+        assertEq(db, "desc B");
     }
 
     function test_CreateListingRevertsOnZeroPrice() public {
         vm.prank(seller);
         vm.expectRevert(ListingManager.ZeroPrice.selector);
-        lm.createListing(0, 1, WINDOW);
+        lm.createListing(0, 1, WINDOW, "", "");
     }
 
     function test_CreateListingRevertsOnZeroSlots() public {
         vm.prank(seller);
         vm.expectRevert(ListingManager.ZeroSlots.selector);
-        lm.createListing(PRICE, 0, WINDOW);
+        lm.createListing(PRICE, 0, WINDOW, "", "");
     }
 
     function test_CreateListingRevertsWhenExceedingMaxSlots() public {
@@ -143,7 +235,7 @@ contract ListingManagerTest is Test {
         uint256 tooMany = max + 1;
         vm.prank(seller);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.TooManySlots.selector, tooMany, max));
-        lm.createListing(PRICE, tooMany, WINDOW);
+        lm.createListing(PRICE, tooMany, WINDOW, "", "");
     }
 
     /// @notice Direct regression test named in the build strategy: a listing cannot be created with a
@@ -153,20 +245,20 @@ contract ListingManagerTest is Test {
 
         vm.prank(seller);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.CompletionWindowTooShort.selector, window, WINDOW));
-        lm.createListing(PRICE, 1, window);
+        lm.createListing(PRICE, 1, window, "", "");
     }
 
     function test_CreateListingRevertsWhenInsufficientFreeIB() public {
         vm.prank(seller);
         vm.expectRevert(abi.encodeWithSelector(IntegrityBond.InsufficientFreeIB.selector, seller, 150 ether, 100 ether));
-        lm.createListing(PRICE, 100, WINDOW); // 1.5 * 1 ether * 100 = 150 ether > 100 ether free
+        lm.createListing(PRICE, 100, WINDOW, "", ""); // 1.5 * 1 ether * 100 = 150 ether > 100 ether free
     }
 
     // ── confirmPayment ─────────────────────────────────────────────────────────────────────────────────────────
 
     function test_ConfirmPaymentStartsCompletionWindow() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 2, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 2, WINDOW, "", "");
 
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
@@ -184,7 +276,7 @@ contract ListingManagerTest is Test {
 
     function test_ConfirmPaymentRevertsWhenNotController() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
 
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.NotController.selector, stranger));
@@ -193,7 +285,7 @@ contract ListingManagerTest is Test {
 
     function test_ConfirmPaymentRevertsWhenSlotNotEmpty() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
 
@@ -204,7 +296,7 @@ contract ListingManagerTest is Test {
 
     function test_ConfirmPaymentRevertsOnOutOfRangeSlot() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
 
         vm.prank(controller);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotIndexOutOfRange.selector, 1, 1));
@@ -213,7 +305,7 @@ contract ListingManagerTest is Test {
 
     function test_ConfirmPaymentRevertsOnClosedListing() public {
         vm.startPrank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         lm.closeListing(listingId);
         vm.stopPrank();
 
@@ -226,7 +318,7 @@ contract ListingManagerTest is Test {
 
     function test_FinalizeExpiredSlotRevertsBeforeDeadline() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
 
@@ -238,7 +330,7 @@ contract ListingManagerTest is Test {
 
     function test_FinalizeExpiredSlotRecyclesToEmptyWithoutUnlockingIB() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
 
@@ -260,7 +352,7 @@ contract ListingManagerTest is Test {
 
     function test_FinalizeExpiredSlotRevertsOnEmptySlot() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotPaymentConfirmed.selector, listingId, 0));
         lm.finalizeExpiredSlot(listingId, 0);
     }
@@ -269,7 +361,7 @@ contract ListingManagerTest is Test {
     ///         subject to the window's expiry, even long after the window would otherwise have elapsed.
     function test_DisputedSlotCannotBeFinalizedByWindowExpiryEvenLongAfterDeadline() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
 
@@ -288,7 +380,7 @@ contract ListingManagerTest is Test {
     ///         expiry keeps the slot locked regardless of remaining window time.
     function test_DisputeOpenedOneBlockBeforeExpiryStillBlocksFinalization() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
 
@@ -307,7 +399,7 @@ contract ListingManagerTest is Test {
 
     function test_ConfirmCompletionRecyclesSlotToEmptyWithoutUnlockingIB() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
         assertEq(bond.freeIB(seller), 100 ether - PER_SLOT_LOCKED); // locked while confirmed
@@ -332,7 +424,7 @@ contract ListingManagerTest is Test {
 
     function test_ConfirmCompletionRevertsWhenCallerIsNotTheBuyer() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
 
@@ -350,7 +442,7 @@ contract ListingManagerTest is Test {
 
     function test_ConfirmCompletionRevertsOnEmptySlot() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         // An unpaid slot has no buyer of record; wrong-status is reported before the buyer check.
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotPaymentConfirmed.selector, listingId, 0));
@@ -359,7 +451,7 @@ contract ListingManagerTest is Test {
 
     function test_ConfirmCompletionRevertsOnDisputedSlot() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.startPrank(controller);
         lm.confirmPayment(listingId, 0, buyer);
         lm.markDisputed(listingId, 0);
@@ -373,7 +465,7 @@ contract ListingManagerTest is Test {
 
     function test_ConfirmCompletionIsIdempotentlyRejectedAfterItSucceeds() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
 
@@ -393,7 +485,7 @@ contract ListingManagerTest is Test {
 
     function test_ConfirmedThenCompletedSlotCanNoLongerBeDisputed() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
 
@@ -408,7 +500,7 @@ contract ListingManagerTest is Test {
 
     function test_ConfirmCompletionRevertsOnOutOfRangeSlot() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotIndexOutOfRange.selector, 1, 1));
         lm.confirmCompletion(listingId, 1);
@@ -434,7 +526,7 @@ contract ListingManagerTest is Test {
         address otherBuyer = makeAddr("otherBuyer");
 
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, totalSlots, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, totalSlots, WINDOW, "", "");
         vm.startPrank(controller);
         for (uint256 i = 0; i < confirmCount; i++) {
             // Give the target slot to `buyer`; every other confirmed slot to a different buyer.
@@ -469,7 +561,7 @@ contract ListingManagerTest is Test {
 
     function test_MarkDisputedRevertsWhenNotController() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
 
@@ -485,7 +577,7 @@ contract ListingManagerTest is Test {
     ///         is still open. See {ListingManager-resolveDispute}'s own doc for the full reasoning.
     function test_ResolveDisputeAlwaysMarksSlotRemovedNeverEmpty() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.startPrank(controller);
         lm.confirmPayment(listingId, 0, buyer);
         lm.markDisputed(listingId, 0);
@@ -506,7 +598,7 @@ contract ListingManagerTest is Test {
 
     function test_ResolveDisputeOnClosedListingAlsoMarksRemoved() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
         vm.prank(seller);
@@ -525,7 +617,7 @@ contract ListingManagerTest is Test {
 
     function test_ResolveDisputeRevertsWhenNotDisputed() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(controller);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotDisputed.selector, listingId, 0));
         lm.resolveDispute(listingId, 0);
@@ -535,7 +627,7 @@ contract ListingManagerTest is Test {
 
     function test_RecycledSlotCanBeSoldToADifferentBuyerWithBondStillLocked() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
 
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer);
@@ -567,7 +659,7 @@ contract ListingManagerTest is Test {
         uint256 sales = bound(salesSeed, 1, 20);
 
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
 
         for (uint256 i = 0; i < sales; i++) {
             address cycleBuyer = address(uint160(uint256(keccak256(abi.encode("cycleBuyer", i)))));
@@ -592,7 +684,7 @@ contract ListingManagerTest is Test {
 
     function test_ReduceSlotsReleasesOnlyEmptySlots() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 3, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 3, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer); // slot 0 now occupied; slots 1,2 still empty
 
@@ -613,7 +705,7 @@ contract ListingManagerTest is Test {
     ///         payment is confirmed can never be reclaimed by reduce/close, regardless of how the seller asks.
     function test_ReduceSlotsCannotTouchAConfirmedSlotEvenIfRequestedCountWouldReachIt() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 2, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 2, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer); // 1 empty slot remains (index 1)
 
@@ -627,7 +719,7 @@ contract ListingManagerTest is Test {
 
     function test_ReduceSlotsRevertsWhenNotSeller() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.NotSeller.selector, stranger, seller));
         lm.reduceSlots(listingId, 1);
@@ -635,7 +727,7 @@ contract ListingManagerTest is Test {
 
     function test_CloseListingReleasesEmptySlotsAndBlocksFutureConfirm() public {
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, 2, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 2, WINDOW, "", "");
         vm.prank(controller);
         lm.confirmPayment(listingId, 0, buyer); // 1 confirmed, 1 empty
 
@@ -660,7 +752,7 @@ contract ListingManagerTest is Test {
 
     function test_CloseListingRevertsWhenAlreadyClosed() public {
         vm.startPrank(seller);
-        uint256 listingId = lm.createListing(PRICE, 1, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
         lm.closeListing(listingId);
         vm.expectRevert(abi.encodeWithSelector(ListingManager.ListingAlreadyClosed.selector, listingId));
         lm.closeListing(listingId);
@@ -683,7 +775,7 @@ contract ListingManagerTest is Test {
         bond.deposit{value: required}();
 
         vm.prank(freshSeller);
-        uint256 listingId = lm.createListing(price, totalSlots, WINDOW);
+        uint256 listingId = lm.createListing(price, totalSlots, WINDOW, "", "");
         assertEq(bond.freeIB(freshSeller), 0);
 
         vm.prank(freshSeller);
@@ -696,7 +788,7 @@ contract ListingManagerTest is Test {
         confirmCount = bound(confirmCount, 1, totalSlots);
 
         vm.prank(seller);
-        uint256 listingId = lm.createListing(PRICE, totalSlots, WINDOW);
+        uint256 listingId = lm.createListing(PRICE, totalSlots, WINDOW, "", "");
         vm.startPrank(controller);
         for (uint256 i = 0; i < confirmCount; i++) {
             lm.confirmPayment(listingId, i, buyer);
