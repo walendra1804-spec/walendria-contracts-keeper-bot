@@ -19,6 +19,13 @@ contract ListingManagerTest is Test {
     uint256 internal constant WINDOW = 72 hours;
 
     event ListingDescribed(uint256 indexed listingId, string title, string description);
+    event SlotWindowExtended(
+        uint256 indexed listingId,
+        uint256 indexed slotIndex,
+        uint256 newWindow,
+        uint256 completionDeadline,
+        uint256 cycle
+    );
 
     function setUp() public {
         // IntegrityBond needs ListingManager's address (as its controller) and ListingManager needs
@@ -810,5 +817,246 @@ contract ListingManagerTest is Test {
             (ListingManager.SlotStatus s,,,) = lm.slots(listingId, i);
             assertEq(uint8(s), uint8(ListingManager.SlotStatus.PaymentConfirmed));
         }
+    }
+
+    // ── extendWindow (seller-initiated completion-window extension, Section 2.5) ──────────────────────────────────
+
+    function test_ExtendWindowOnPaymentConfirmedPushesDeadlineByTheIncrease() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+
+        (, uint256 deadlineBefore,,) = lm.slots(listingId, 0);
+        assertEq(deadlineBefore, block.timestamp + WINDOW);
+
+        uint256 newWindow = WINDOW + 48 hours;
+        vm.prank(seller);
+        lm.extendWindow(listingId, 0, newWindow);
+
+        (, uint256 deadlineAfter,,) = lm.slots(listingId, 0);
+        assertEq(deadlineAfter, deadlineBefore + 48 hours, "deadline moves out by exactly the window increase");
+        assertEq(lm.slotWindowOverride(listingId, 0), newWindow);
+    }
+
+    function test_ExtendWindowEmitsEvent() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+        (, uint256 deadlineBefore,, uint256 cycle) = lm.slots(listingId, 0);
+
+        uint256 newWindow = WINDOW + 1 hours;
+        vm.expectEmit(true, true, false, true, address(lm));
+        emit SlotWindowExtended(listingId, 0, newWindow, deadlineBefore + 1 hours, cycle);
+        vm.prank(seller);
+        lm.extendWindow(listingId, 0, newWindow);
+    }
+
+    /// @notice A seller can pre-extend a still-Empty slot; the longer window takes effect at the next payment.
+    function test_ExtendWindowOnEmptySlotAppliesAtNextPayment() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+
+        uint256 newWindow = WINDOW + 24 hours;
+        vm.prank(seller);
+        lm.extendWindow(listingId, 0, newWindow);
+        assertEq(lm.slotWindowOverride(listingId, 0), newWindow);
+
+        // Empty slot carries no live deadline yet.
+        (ListingManager.SlotStatus status, uint256 deadline,,) = lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.Empty));
+        assertEq(deadline, 0);
+
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+        (, uint256 paidDeadline,,) = lm.slots(listingId, 0);
+        assertEq(paidDeadline, block.timestamp + newWindow, "next buyer inherits the pre-extended window");
+    }
+
+    /// @notice Extensions are per-sale: a recycled slot forgets its override, so its next buyer starts from the
+    ///         listing default again unless the seller extends anew.
+    function test_ExtendWindowIsPerSaleClearedOnCompletionRecycle() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+
+        vm.prank(seller);
+        lm.extendWindow(listingId, 0, WINDOW + 12 hours);
+        assertEq(lm.slotWindowOverride(listingId, 0), WINDOW + 12 hours);
+
+        vm.prank(buyer);
+        lm.confirmCompletion(listingId, 0);
+        assertEq(lm.slotWindowOverride(listingId, 0), 0, "override cleared when the slot recycles");
+
+        address secondBuyer = makeAddr("secondBuyer");
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, secondBuyer);
+        (, uint256 deadline,,) = lm.slots(listingId, 0);
+        assertEq(deadline, block.timestamp + WINDOW, "recycled slot reverts to the listing default window");
+    }
+
+    function test_ExtendWindowClearedOnFinalizeExpiredSlot() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+        vm.prank(seller);
+        lm.extendWindow(listingId, 0, WINDOW + 6 hours);
+
+        vm.warp(block.timestamp + WINDOW + 6 hours);
+        lm.finalizeExpiredSlot(listingId, 0);
+        assertEq(lm.slotWindowOverride(listingId, 0), 0);
+    }
+
+    /// @notice Extending is buyer-favorable, so a seller may even "revive" a slot whose original deadline has
+    ///         technically passed but which nobody has finalized yet - as long as it is still PaymentConfirmed.
+    function test_ExtendWindowRevivesExpiredButUnfinalizedSlot() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        uint256 paymentTime = block.timestamp;
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+
+        // Sail past the original deadline without anyone finalizing.
+        vm.warp(paymentTime + WINDOW + 1 hours);
+
+        uint256 newWindow = WINDOW + 100 hours;
+        vm.prank(seller);
+        lm.extendWindow(listingId, 0, newWindow);
+
+        (ListingManager.SlotStatus status, uint256 deadline,,) = lm.slots(listingId, 0);
+        assertEq(uint8(status), uint8(ListingManager.SlotStatus.PaymentConfirmed), "still a live sale");
+        assertEq(
+            deadline, paymentTime + newWindow, "deadline recomputed to paymentTime + new window, now in the future"
+        );
+        assertGt(deadline, block.timestamp, "revived: window no longer expired");
+
+        // And finalize now reverts again, since the window is no longer expired.
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.WindowNotYetExpired.selector, listingId, 0, deadline));
+        lm.finalizeExpiredSlot(listingId, 0);
+    }
+
+    function test_ExtendWindowRevertsOnEqualWindow() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+
+        // WINDOW == MIN, so it clears the floor check, then fails the strict-increase check.
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.WindowNotExtended.selector, WINDOW, WINDOW));
+        lm.extendWindow(listingId, 0, WINDOW);
+    }
+
+    function test_ExtendWindowRevertsBelowMinimumFloor() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+
+        uint256 tooShort = 71 hours; // below the 72h protocol floor
+        // Read the constant *before* pranking: a call to `lm` inside the expectRevert argument would otherwise
+        // consume the prank, so extendWindow would run as the test contract and revert NotSeller instead.
+        uint256 minWindow = lm.MIN_COMPLETION_WINDOW();
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.CompletionWindowTooShort.selector, tooShort, minWindow));
+        lm.extendWindow(listingId, 0, tooShort);
+    }
+
+    function test_ExtendWindowRevertsOnDecreaseAfterAPriorExtension() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+
+        vm.prank(seller);
+        lm.extendWindow(listingId, 0, WINDOW + 10 hours);
+
+        // A value that is above the 72h floor but below the current (already-extended) window is still refused.
+        vm.prank(seller);
+        vm.expectRevert(
+            abi.encodeWithSelector(ListingManager.WindowNotExtended.selector, WINDOW + 5 hours, WINDOW + 10 hours)
+        );
+        lm.extendWindow(listingId, 0, WINDOW + 5 hours);
+    }
+
+    function test_ExtendWindowRevertsWhenNotSeller() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.NotSeller.selector, stranger, seller));
+        lm.extendWindow(listingId, 0, WINDOW + 1 hours);
+
+        // Not even the buyer of record may extend - it is the seller's own bond and offer.
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.NotSeller.selector, buyer, seller));
+        lm.extendWindow(listingId, 0, WINDOW + 1 hours);
+    }
+
+    function test_ExtendWindowRevertsWhenSlotOutOfRange() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotIndexOutOfRange.selector, 1, 1));
+        lm.extendWindow(listingId, 1, WINDOW + 1 hours);
+    }
+
+    function test_ExtendWindowRevertsWhenDisputed() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        vm.startPrank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+        lm.markDisputed(listingId, 0);
+        vm.stopPrank();
+
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotExtendable.selector, listingId, 0));
+        lm.extendWindow(listingId, 0, WINDOW + 1 hours);
+    }
+
+    function test_ExtendWindowRevertsWhenRemoved() public {
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        // Reclaiming the empty slot marks it Removed.
+        vm.prank(seller);
+        lm.reduceSlots(listingId, 1);
+
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(ListingManager.SlotNotExtendable.selector, listingId, 0));
+        lm.extendWindow(listingId, 0, WINDOW + 1 hours);
+    }
+
+    /// @notice Cumulative extensions always leave the deadline at exactly paymentTime + latest window, with no
+    ///         drift, whatever intermediate values were chosen.
+    function testFuzz_ExtendWindowDeadlineEqualsPaymentPlusLatestWindow(uint256 firstExtra, uint256 secondExtra)
+        public
+    {
+        firstExtra = bound(firstExtra, 1, 3650 days);
+        secondExtra = bound(secondExtra, 1, 3650 days);
+
+        vm.prank(seller);
+        uint256 listingId = lm.createListing(PRICE, 1, WINDOW, "", "");
+        uint256 paymentTime = block.timestamp;
+        vm.prank(controller);
+        lm.confirmPayment(listingId, 0, buyer);
+
+        uint256 w1 = WINDOW + firstExtra;
+        vm.prank(seller);
+        lm.extendWindow(listingId, 0, w1);
+        (, uint256 d1,,) = lm.slots(listingId, 0);
+        assertEq(d1, paymentTime + w1);
+        assertEq(lm.slotWindowOverride(listingId, 0), w1);
+
+        uint256 w2 = w1 + secondExtra;
+        vm.prank(seller);
+        lm.extendWindow(listingId, 0, w2);
+        (, uint256 d2,,) = lm.slots(listingId, 0);
+        assertEq(d2, paymentTime + w2, "cumulative extensions keep deadline = paymentTime + latest window");
+        assertEq(lm.slotWindowOverride(listingId, 0), w2);
     }
 }

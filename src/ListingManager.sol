@@ -117,6 +117,13 @@ contract ListingManager {
     mapping(uint256 listingId => Listing) public listings;
     mapping(uint256 listingId => mapping(uint256 slotIndex => Slot)) public slots;
     mapping(uint256 listingId => ListingMetadata) public listingMetadata;
+
+    /// @notice Per-slot completion-window override in seconds, or 0 to inherit the listing's `completionWindow`
+    ///         (Section 2.5 extension). Set only by the seller via {extendWindow}, only ever upward, and always
+    ///         at least {MIN_COMPLETION_WINDOW}. Kept in its own mapping rather than a `Slot` field so the public
+    ///         `slots` getter's shape is unchanged. Reset to 0 whenever the slot recycles to Empty, so each fresh
+    ///         sale of a recycled slot starts from the listing default again unless the seller extends anew.
+    mapping(uint256 listingId => mapping(uint256 slotIndex => uint256)) public slotWindowOverride;
     uint256 public nextListingId;
 
     event ListingCreated(
@@ -143,6 +150,15 @@ contract ListingManager {
     event SlotResolved(uint256 indexed listingId, uint256 indexed slotIndex, uint256 cycle);
     event SlotsReduced(uint256 indexed listingId, uint256 count);
     event ListingClosed(uint256 indexed listingId);
+    /// @dev `newWindow` is the slot's new total completion-window duration; `completionDeadline` is its live
+    ///      deadline after the extension (0 when the slot is still Empty and thus has no running clock yet).
+    event SlotWindowExtended(
+        uint256 indexed listingId,
+        uint256 indexed slotIndex,
+        uint256 newWindow,
+        uint256 completionDeadline,
+        uint256 cycle
+    );
 
     error NoControllers();
     error NotController(address caller);
@@ -164,6 +180,8 @@ contract ListingManager {
     error SlotNotDisputed(uint256 listingId, uint256 slotIndex);
     error WindowNotYetExpired(uint256 listingId, uint256 slotIndex, uint256 deadline);
     error InsufficientEmptySlots(uint256 listingId, uint256 requested, uint256 available);
+    error SlotNotExtendable(uint256 listingId, uint256 slotIndex);
+    error WindowNotExtended(uint256 requested, uint256 current);
 
     /// @param _integrityBond The direct Integrity Bond contract this ListingManager locks/unlocks against. This
     ///        ListingManager must separately be registered as a controller on that contract.
@@ -254,7 +272,9 @@ contract ListingManager {
         if (slot.status != SlotStatus.Empty) revert SlotNotEmpty(listingId, slotIndex);
 
         slot.status = SlotStatus.PaymentConfirmed;
-        slot.completionDeadline = block.timestamp + listing.completionWindow;
+        // Uses the slot's effective window: a seller may have pre-extended this (still-Empty) slot's window via
+        // {extendWindow} before any buyer paid, in which case that longer window applies from this payment.
+        slot.completionDeadline = block.timestamp + _effectiveWindow(listingId, slotIndex, listing.completionWindow);
         slot.buyer = buyer;
         slot.cycle += 1;
         listing.emptySlots -= 1;
@@ -284,6 +304,9 @@ contract ListingManager {
         slot.status = SlotStatus.Empty;
         slot.completionDeadline = 0;
         slot.buyer = address(0);
+        // Any window extension applied to this now-finished sale is per-sale: clear it so the next buyer of this
+        // recycled slot starts from the listing default again, unless the seller extends anew.
+        slotWindowOverride[listingId][slotIndex] = 0;
         listing.emptySlots += 1;
 
         emit SlotFinalized(listingId, slotIndex, slot.cycle);
@@ -312,9 +335,63 @@ contract ListingManager {
         slot.status = SlotStatus.Empty;
         slot.completionDeadline = 0;
         slot.buyer = address(0);
+        // See {finalizeExpiredSlot}: window extensions are per-sale, so a recycled slot forgets them.
+        slotWindowOverride[listingId][slotIndex] = 0;
         listing.emptySlots += 1;
 
         emit SlotCompleted(listingId, slotIndex, msg.sender, slot.cycle);
+    }
+
+    /// @notice Seller-only, per-slot lengthening of the completion window - the buyer's dispute-protection
+    ///         interval (Section 2.5). It can only ever make the window *longer*: a seller may give buyers more
+    ///         time, never less, and never below the {MIN_COMPLETION_WINDOW} floor. This is unambiguously
+    ///         buyer-favorable (more time to notice a problem and open a dispute), so it needs no cap on the
+    ///         extension length or on how many times it is called - a seller who over-extends only ties up their
+    ///         own Locked IB longer, which is their own cost to bear, not an attack surface.
+    ///
+    ///         Works on a slot in either of the two states where a window is meaningful:
+    ///           - Empty (not yet paid): records the longer window this slot's *next* buyer will receive; it takes
+    ///             effect at {confirmPayment}. Because extensions are per-sale (cleared when a slot recycles), this
+    ///             is a pre-arranged, one-sale courtesy, not a permanent change to the slot index.
+    ///           - PaymentConfirmed (paid, in-progress): also pushes the live `completionDeadline` out immediately
+    ///             by exactly the window increase - i.e. the new deadline equals paymentTime + `newWindow` - so the
+    ///             current buyer gains the extra time the instant this lands. Permitted even after the original
+    ///             deadline has technically passed but before anyone has called {finalizeExpiredSlot} (still
+    ///             strictly buyer-favorable; the permissionless finalize racing this extension is a symmetric,
+    ///             acceptable outcome).
+    ///
+    ///         A Disputed or Removed slot reverts {SlotNotExtendable}: a dispute already permanently froze the
+    ///         window (Section 2.5), and a Removed slot is retired - extending either would be meaningless.
+    /// @param newWindow The slot's new *total* completion-window duration in seconds, measured from payment. Must
+    ///        be strictly greater than the slot's current effective window (and hence at least
+    ///        {MIN_COMPLETION_WINDOW}); anything else reverts rather than silently no-op'ing.
+    function extendWindow(uint256 listingId, uint256 slotIndex, uint256 newWindow) external {
+        Listing storage listing = _requireListing(listingId);
+        if (msg.sender != listing.seller) revert NotSeller(msg.sender, listing.seller);
+        if (slotIndex >= listing.totalSlots) revert SlotIndexOutOfRange(slotIndex, listing.totalSlots);
+
+        Slot storage slot = slots[listingId][slotIndex];
+        if (slot.status != SlotStatus.Empty && slot.status != SlotStatus.PaymentConfirmed) {
+            revert SlotNotExtendable(listingId, slotIndex);
+        }
+
+        uint256 current = _effectiveWindow(listingId, slotIndex, listing.completionWindow);
+        // Explicit floor even though `current >= MIN_COMPLETION_WINDOW` already holds (every listing window is
+        // floored at creation and the override can only ever rise): documents the invariant and stays correct
+        // even if that upstream guarantee ever changed.
+        if (newWindow < MIN_COMPLETION_WINDOW) revert CompletionWindowTooShort(newWindow, MIN_COMPLETION_WINDOW);
+        if (newWindow <= current) revert WindowNotExtended(newWindow, current);
+
+        slotWindowOverride[listingId][slotIndex] = newWindow;
+
+        // A live sale gains the extra time immediately. `current` is exactly the window in force for this cycle,
+        // so `newWindow - current` is the increase to add - yielding a deadline of paymentTime + newWindow without
+        // ever having to store paymentTime. An Empty slot has no running clock; its deadline stays 0.
+        if (slot.status == SlotStatus.PaymentConfirmed) {
+            slot.completionDeadline += (newWindow - current);
+        }
+
+        emit SlotWindowExtended(listingId, slotIndex, newWindow, slot.completionDeadline, slot.cycle);
     }
 
     /// @notice Freezes `slotIndex` against window-expiry finalization once a dispute has opened against it
@@ -377,6 +454,18 @@ contract ListingManager {
     function _requireListing(uint256 listingId) internal view returns (Listing storage listing) {
         listing = listings[listingId];
         if (listing.seller == address(0)) revert ListingNotFound(listingId);
+    }
+
+    /// @dev The completion window in force for a specific slot: its per-slot override if the seller has extended
+    ///      it ({extendWindow}), otherwise the listing default. `listingWindow` is passed in so callers that
+    ///      already hold the `Listing` in storage avoid a redundant load.
+    function _effectiveWindow(uint256 listingId, uint256 slotIndex, uint256 listingWindow)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 slotWindow = slotWindowOverride[listingId][slotIndex];
+        return slotWindow == 0 ? listingWindow : slotWindow;
     }
 
     function _reduceEmptySlots(uint256 listingId, Listing storage listing, uint256 count) internal {
