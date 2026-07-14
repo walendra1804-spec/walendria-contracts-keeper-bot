@@ -19,8 +19,10 @@ blast radius of any single exploited path. Preserve it; don't propose audits or 
    fresh deploy at new addresses (Section 2.8), never an admin write.
 2. **keeper-bot** (`keeper-bot/`, this repo) — indexes events + runs the poke/settlement loop. Runs on a VPS
    under pm2 as `walendria-keeper`. See "VPS sync" below — there's a critical gotcha.
-3. **walendria-app** (`D:\walendria-app`) — Next.js frontend, reads **indexer-first** (INDEXER_URL =
-   `https://indexer.walendria.org`, Cloudflare-fronted) with a direct-RPC fallback.
+3. **walendria-app** (`D:\walendria-app`, deployed to VPS at `https://walendria.org`) — Next.js frontend,
+   reads **indexer-first** (INDEXER_URL = `https://indexer.walendria.org`, Cloudflare-fronted) with a
+   direct-RPC fallback. Same VPS as keeper-bot, served through the same `walendria-web` cloudflared tunnel.
+   Redeploy flow lives in the "walendria.org — deploying the app to the VPS" section below.
 
 The **current live addresses + deploy block** live in exactly three places, which must always agree:
 - `walendria-app/src/lib/contracts.ts` — all 9 `CONTRACT_ADDRESSES[gnosisChiado.id]` + `DEPLOYMENT_BLOCK`
@@ -113,12 +115,95 @@ deploy block) + `curl localhost:4000/events/listings`, then `curl https://indexe
 
 ## The app (D:\walendria-app)
 
-- No git remote — local only, `npm run dev`. After an address change in `contracts.ts`, tell the user to
+- No git remote — local only, `npm run dev` for local dev. Production deploy lives on the VPS at
+  `https://walendria.org` (see next section). After an address change in `contracts.ts`, tell the user to
   **restart the dev server** (`rm -rf .next && npm run dev`) — server-component module consts don't hot-swap.
 - Verify app changes with `npx tsc --noEmit`, `npx eslint <files>`, and `npx next build`. Watch the
   `react-hooks/set-state-in-effect` rule: don't `setState` synchronously in a `useEffect`; effects may only
   call out to external systems / parent callbacks (the finalize-then-refetch pattern is the template).
-- Most pages are `force-dynamic` server components doing on-chain/indexer reads.
+- Most pages are `force-dynamic` server components doing on-chain/indexer reads — production must be
+  `next start`, **not** a static export (would break every dynamic page).
+
+## walendria.org — deploying the app to the VPS
+
+Same VPS as keeper-bot (`ubuntu@ubuntu`, Ubuntu 22.04). App lives at `/root/walendria-app/`, runs under pm2
+as `walendria-app` on port `4180`. Cloudflared classic tunnel `walendria-web` (id
+`fd0fa331-ed8c-492b-a7b3-d4d06ecf469e`, config `/etc/cloudflared/config.yml`) routes `walendria.org` +
+`www.walendria.org` → `127.0.0.1:4180`. **DNS and ingress rules are already correct — never touch the
+tunnel config to swap the app version; just replace what listens on 4180.**
+
+Port map on the VPS: `4000` = keeper-bot indexer, `4180` = walendria-app, `6080` = vnc.walendria.org.
+
+### SSH access from the working machine
+
+VPS provider is a Shopee reseller — **the public IP rotates roughly monthly** (seller re-issues via Shopee
+chat when it changes; last known 2026-07: `38.253.224.22`). Port `22054`, user `root`. Password auth is
+prohibited for Claude (Anthropic rule — no password/token entry in any field). Instead, an ed25519 key
+`claude-walendria-setup` (fingerprint `SHA256:Q4zXGhunI/I7ATnEUEIIpdMZcKbeRouH5S/H+hMfszU`) is
+installed in `/root/.ssh/authorized_keys` on the VPS and lives on the working machine at
+`C:\Users\ASUS\.ssh\id_walendria_vps` (chmod 600).
+
+Test with `ssh -i "$HOME/.ssh/id_walendria_vps" -p 22054 root@<current-ip> "hostname && pm2 list"`. If the
+IP changed, ask the user for the new one. If the key was revoked, regenerate a new one, then re-install via
+a one-shot Python + paramiko script that prompts for the VPS password locally (never on the SSH command
+line, never logged) and writes the pubkey to `authorized_keys` — model the same shape as
+`install_claude_key.py` from the 2026-07-14 setup: `getpass.getpass` for password, `paramiko.SSHClient` for
+one-shot install, self-verify with key auth before exiting.
+
+Ban gotcha: **repeated failed SSH attempts trigger fail2ban** on the VPS — pattern is TCP accepted then
+immediate `kex_exchange_identification: Connection closed`. Cure: change the client's public IP (router
+reboot / mobile hotspot) or wait for the ban window (~10-60 min), never retry-loop.
+
+### Redeploying the app (source-only sync + rebuild)
+
+The app has no git remote and D:\walendria-app is not on the VPS. Sync source via tar-over-ssh (rsync isn't
+on Windows). The `.env.local` on the VPS contains `PINATA_JWT` — never overwrite it blindly; transfer
+separately only when it actually changed.
+
+```bash
+KEY="$HOME/.ssh/id_walendria_vps"
+VPS=root@<current-ip>          # ask user or verify last-known IP still connects
+cd /d/walendria-app
+tar --exclude=node_modules --exclude=.next --exclude=.git --exclude=.env.local \
+    --exclude=tsconfig.tsbuildinfo -czf - . \
+  | ssh -i "$KEY" -p 22054 "$VPS" "mkdir -p /root/walendria-app && tar -xzf - -C /root/walendria-app"
+# then on VPS:
+ssh -i "$KEY" -p 22054 "$VPS" "cd /root/walendria-app && \
+    npm install --no-audit --no-fund && \
+    npm run build && \
+    pm2 restart walendria-app --update-env && \
+    pm2 save"
+```
+
+Two hard-earned rules:
+
+1. **`npm install`, not `npm ci`.** The lock file has drifted (`zod` currently missing at the version the
+   tree resolves to), so `npm ci`'s strict lock check errors out with a bizarre help-text dump. `npm install`
+   heals the lock in place. If the lock is ever fully re-synced from local, `npm ci` becomes usable again.
+2. **Never re-enable `wp-landing.service`** while walendria-app runs. It's the old python static server that
+   used to serve walendria.org from `/root/reaworks-landing/` on port 4180 — was `systemctl stop && disable`
+   during the 2026-07-14 swap. Backup lives at `/root/backups/reaworks-landing-*.tar.gz`. Starting it again
+   grabs port 4180 first at boot and locks pm2 out.
+
+Verify a redeploy: `curl -sI http://127.0.0.1:4180` from VPS (must be 200 with `X-Powered-By: Next.js`), then
+`curl -sI https://walendria.org` externally. Cross-check `curl https://indexer.walendria.org/health` didn't
+regress (keeper-bot is on the same box; a bad app deploy shouldn't touch it, but you're one `pm2 restart all`
+away from breaking both).
+
+pm2 is configured to boot-persist: `pm2-root.service` is enabled and `pm2 save` writes both apps to
+`/root/.pm2/dump.pm2`. Always `pm2 save` after any process add/remove or the resurrection on next boot
+will forget the change.
+
+Ecosystem file at `/root/walendria-app/ecosystem.config.js` sets `PORT=4180`, `NODE_ENV=production`, and
+`max_memory_restart=900M`. Don't move the app to another port — the tunnel config is scoped to 4180.
+
+### Perf tune to consider once (not urgent)
+
+`INDEXER_URL` on the VPS `.env.local` currently points at `https://indexer.walendria.org`, which means every
+server-side fetch from the app loops out through Cloudflare and back to the same box's port 4000. Setting
+`INDEXER_URL=http://127.0.0.1:4000` on the VPS `.env.local` (leave the local `.env.local` alone) and `pm2
+restart walendria-app` cuts that hop entirely. Not blocking — noted here so future sessions don't need to
+re-derive it.
 
 ## Conventions
 
