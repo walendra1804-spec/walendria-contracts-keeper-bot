@@ -124,6 +124,26 @@ contract ListingManagerHandler is Test {
         lm.closeListing(listingId);
     }
 
+    /// @notice Adds extendWindow to the fuzz surface. Bounded so a random path can extend an Empty or
+    ///         PaymentConfirmed slot to any window between the current effective + 1 and current + 30 days.
+    ///         Reverts (Disputed/Removed/not-strictly-greater) are silently dropped - the fuzzer keeps searching.
+    function extendWindow(uint256 listingSeed, uint256 slotSeed, uint256 extraSeed) external {
+        if (listingIds.length == 0) return;
+        uint256 listingId = _pickListing(listingSeed);
+        (address seller,, uint256 totalSlots,, uint256 listingWindow,,) = lm.listings(listingId);
+        uint256 slotIndex = slotSeed % totalSlots;
+        (ListingManager.SlotStatus status,,,) = lm.slots(listingId, slotIndex);
+        if (status != ListingManager.SlotStatus.Empty && status != ListingManager.SlotStatus.PaymentConfirmed) return;
+
+        uint256 override_ = lm.slotWindowOverride(listingId, slotIndex);
+        uint256 current = override_ == 0 ? listingWindow : override_;
+        uint256 extra = bound(extraSeed, 1, 30 days);
+        uint256 newWindow = current + extra;
+
+        vm.prank(seller);
+        lm.extendWindow(listingId, slotIndex, newWindow);
+    }
+
     function sellersCount() external view returns (uint256) {
         return sellers.length;
     }

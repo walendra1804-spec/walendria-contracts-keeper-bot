@@ -10,6 +10,8 @@ out/
 !/broadcast
 /broadcast/*/31337/
 /broadcast/**/dry-run/
+# Per-deploy timestamped records are noise; run-latest.json stays tracked as the canonical deploy record
+/broadcast/**/run-1*.json
 
 # Docs
 docs/

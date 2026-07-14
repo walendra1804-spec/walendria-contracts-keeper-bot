@@ -68,4 +68,40 @@ contract ListingManagerInvariantTest is Test {
             assertEq(actualLocked, expectedLocked);
         }
     }
+
+    /// @notice extendWindow invariant #1: every stored slotWindowOverride is either 0 (default / not set) or
+    ///         >= MIN_COMPLETION_WINDOW - the protocol floor is inviolable regardless of what path set it.
+    function invariant_SlotWindowOverrideNeverBelowMin() public view {
+        uint256 minWindow = lm.MIN_COMPLETION_WINDOW();
+        for (uint256 i = 0; i < handler.listingIdsCount(); i++) {
+            uint256 listingId = handler.listingIds(i);
+            (,, uint256 totalSlots,,,,) = lm.listings(listingId);
+            for (uint256 slotIdx = 0; slotIdx < totalSlots; slotIdx++) {
+                uint256 override_ = lm.slotWindowOverride(listingId, slotIdx);
+                if (override_ != 0) {
+                    assertGe(override_, minWindow);
+                }
+            }
+        }
+    }
+
+    /// @notice extendWindow invariant #2: a PaymentConfirmed slot's completionDeadline is always AT LEAST
+    ///         block.timestamp - (effective window looking backward is meaningless). More precisely: the deadline
+    ///         must be at least MIN_COMPLETION_WINDOW from *some* past timestamp, which reduces to
+    ///         completionDeadline >= MIN_COMPLETION_WINDOW (since payment happened at some real timestamp >= 0
+    ///         and deadline = paymentTime + effectiveWindow >= 0 + MIN). This is a lightweight sanity check on
+    ///         the deadline math the extendWindow feature is expected to preserve.
+    function invariant_PaymentConfirmedDeadlineNeverBelowMinFloor() public view {
+        uint256 minWindow = lm.MIN_COMPLETION_WINDOW();
+        for (uint256 i = 0; i < handler.listingIdsCount(); i++) {
+            uint256 listingId = handler.listingIds(i);
+            (,, uint256 totalSlots,,,,) = lm.listings(listingId);
+            for (uint256 slotIdx = 0; slotIdx < totalSlots; slotIdx++) {
+                (ListingManager.SlotStatus status, uint256 deadline,,) = lm.slots(listingId, slotIdx);
+                if (status == ListingManager.SlotStatus.PaymentConfirmed) {
+                    assertGe(deadline, minWindow);
+                }
+            }
+        }
+    }
 }
