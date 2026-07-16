@@ -1,5 +1,5 @@
 import { parseAbi } from "viem";
-import { gnosisChiado } from "viem/chains";
+import { gnosis } from "viem/chains";
 
 /**
  * Mirrors walendria-app/src/lib/contracts.ts — same live Chiado deployment, duplicated here rather than
@@ -7,9 +7,12 @@ import { gnosisChiado } from "viem/chains";
  * tree (app strategy doc Section 3: "can share a codebase... rather than being a fully separate project" is
  * an option, not a requirement — a single small file duplicated is simpler to deploy on its own to a VPS).
  */
-export const CHAIN = gnosisChiado;
+// Staged for the Gnosis mainnet cutover (deploy block 47230742). VPS keeper still runs an untracked
+// copy of the previous config.js until the CLAUDE.md-documented update flow (git pull + cp + pm2 restart)
+// runs, so committing this file does not itself switch the live indexer.
+export const CHAIN = gnosis;
 
-export const RPC_URL = process.env.RPC_URL || "https://rpc.chiadochain.net";
+export const RPC_URL = process.env.RPC_URL || "https://gnosis-rpc.publicnode.com";
 
 export const POLL_INTERVAL_MS = process.env.POLL_INTERVAL_MS
   ? Number(process.env.POLL_INTERVAL_MS)
@@ -27,14 +30,14 @@ export const INDEX_CHUNK_SIZE = process.env.INDEX_CHUNK_SIZE ? BigInt(process.en
 
 export const HTTP_PORT = process.env.HTTP_PORT ? Number(process.env.HTTP_PORT) : 4000;
 
-export const DEPLOYMENT_BLOCK = 22071544n;
+export const DEPLOYMENT_BLOCK = 47230742n;
 
 export const ADDRESSES = {
-  listingManager: "0x2eE99705f73ce6D43e515E1AFa258ff39Aa2fF20",
-  spectralMarket: "0x5B20084bC5B2388fdDc43b09B50C80A062496F18",
-  settlementConditions: "0x1375a52a4aE9CfE7c6B84EB730B4B11b286dB709",
-  disputeManager: "0x46bd1bCD78f307f91925719CBB613C5C1E1f5C36",
-  evidenceRegistry: "0x43Ae3055a0dF9503D1a2dc1F3cfF02c54001a47e",
+  listingManager: "0xAF070b902aB31262b35E0Dc24809aE80B70918b9",
+  spectralMarket: "0xa68a83944BDD92Fc066c32b69f07E1519b728857",
+  settlementConditions: "0xd07B2bEFB8590A861f8D6c1eF8AFb39c89197509",
+  disputeManager: "0x75ba345B89A9653C98E38958d84359A6cE9233b6",
+  evidenceRegistry: "0x0002B137e4bCd744F121C40A78AD49290ed8025e",
 };
 
 export const listingManagerAbi = parseAbi([
