@@ -16,7 +16,7 @@ invariant = { runs = 256, depth = 500 }
 chiado = "https://rpc.chiadochain.net"
 # Gnosis mainnet (chain id 100). Unlike Chiado there is a REAL fee market here — never reuse the
 # 0.001-gwei admission-reservation trick from CLAUDE.md's Chiado flow; let forge estimate fees.
-gnosis = "https://rpc.gnosischain.com"
+gnosis = "https://gnosis-rpc.publicnode.com"
 anvil = "http://127.0.0.1:8545"
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
