@@ -14,8 +14,10 @@ invariant = { runs = 256, depth = 500 }
 
 [rpc_endpoints]
 chiado = "https://rpc.chiadochain.net"
-# Gnosis mainnet (chain id 100). Unlike Chiado there is a REAL fee market here — never reuse the
-# 0.001-gwei admission-reservation trick from CLAUDE.md's Chiado flow; let forge estimate fees.
+# Gnosis mainnet (chain id 100). Empirically as quiet as Chiado (base fee 0 gwei, gas-price ~8700 wei
+# checked 2026-07-16), so the 0.001-gwei / 1e-6-gwei Chiado deploy flags work identically here today.
+# If mainnet ever gets busy, drop those flags and let forge estimate — LOW_GAS_FEES in walendria-app is
+# already Chiado-conditional so app users adapt automatically.
 gnosis = "https://gnosis-rpc.publicnode.com"
 anvil = "http://127.0.0.1:8545"
 
