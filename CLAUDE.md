@@ -302,3 +302,72 @@ getter's arity and breaks ~40 test destructurings.** If you need per-slot state,
 mapping** (e.g. `slotWindowOverride`) so the getter shape is untouched. The whitepaper
 `walendria-app/public/walendria-protocol-the28.md` is the **verbatim canonical** doc — don't edit it for
 incremental features; update `/rules` and NatSpec instead.
+
+## Priority protection — DocumentNotary + Zenodo runbook
+
+Deliberately separate from the main protocol: `src/DocumentNotary.sol` is a one-function stateless
+contract that anchors a document's SHA-256 to `block.timestamp` under `msg.sender`, so every whitepaper
+and essay published under `walendria-app/src/app/articles/` has an independently-verifiable priority
+date. The `walendria-app/src/app/priority/` page is the catalog UI. Author + on-chain identity are
+Panca Walendra (`0xC8bfedCC142b0C915CA83E214a71d6607C89d310`, the same deployer wallet). This runbook
+covers a full anchoring cycle end-to-end.
+
+### One-time: deploy the notary on Gnosis mainnet
+
+User runs (interactive keystore password). Deploy is a single CREATE, ~120k gas total.
+```bash
+forge script script/DeployNotary.s.sol:DeployNotary --rpc-url gnosis --account walendria-chiado \
+  --broadcast --slow --with-gas-price 1000000 --priority-gas-price 1000
+```
+Then:
+1. Grab the notary address from `broadcast/DeployNotary.s.sol/100/run-latest.json`.
+2. Bytecode length check: `cast code <addr> --rpc-url gnosis` byte length vs
+   `out/DocumentNotary.sol/DocumentNotary.json` `deployedBytecode` length.
+3. Write the address into `walendria-app/.env.local` (VPS) as
+   `NEXT_PUBLIC_MAINNET_DOCUMENT_NOTARY_ADDRESS=0x…` — the `/priority` page then flips from
+   "Pending deploy" to a linked contract card without a code change.
+
+### Per-document: refresh hash → notarize → record
+
+Whenever a whitepaper or article body changes, or a new one is published:
+```bash
+# 1. Refresh SHA-256 in walendria-app/src/lib/priorityDocuments.ts
+cd D:/walendria-app && node scripts/hash-documents.mjs --write
+```
+Then for each document whose hash has just been set (or is new), notarize on-chain:
+```bash
+# 2. Notarize — pass 0x-prefixed sha256, title, uri as verbatim strings
+cast send <NOTARY_ADDR> "notarize(bytes32,string,string)" \
+  0x<sha256> "The Apparatus Was Not the Point" "https://walendria.org/articles/the-apparatus-was-not-the-point" \
+  --rpc-url gnosis --account walendria-chiado \
+  --gas-price 1000000 --priority-gas-price 1000
+```
+Then update `walendria-app/src/lib/priorityDocuments.ts` for that slug:
+- `notarizedTx`: the transaction hash from `cast send`'s output
+- `notarizedBlock`: `cast tx <hash> --rpc-url gnosis` → `blockNumber` field (decimal)
+- `notarizedAt`: ISO timestamp — `cast block <block> --rpc-url gnosis` → `timestamp` field, then to ISO
+- commit + push (walendria-contracts remote); redeploy walendria-app to VPS so `/priority` shows the anchor
+
+### Per-document: Zenodo upload (user-manual, browser)
+
+Zenodo (https://zenodo.org) is free, CERN-hosted, gives a permanent DOI per record. Sign in with
+GitHub OAuth. For each document:
+1. New upload → Publication type: **Working paper** (whitepaper) or **Preprint** (articles).
+2. Title: match the document title exactly.
+3. Authors: **Panca Walendra**, affiliation blank, ORCID blank unless the user has one.
+4. Description: paste the article's `<Lead>` paragraph or the whitepaper's abstract.
+5. Keywords: pull from the article's `tags` array in `walendria-app/src/lib/articles.ts`.
+6. License: **MIT** (matches the repo's contract license header for consistency).
+7. Related identifiers: URL → the `documentUri` from priorityDocuments.ts.
+8. Upload the exact file whose SHA-256 was hashed (whitepaper `.md` for the whitepaper; for each
+   article, a print-to-PDF of the rendered page, or the raw `.tsx` — pick one convention and hold it).
+9. Publish. Copy the DOI (format `10.5281/zenodo.NNNNNNN`) back into `priorityDocuments.ts`
+   `zenodoDoi` for that slug. Commit + redeploy `/priority`.
+
+### Never anchor under a different key
+
+Every notarization must go out from the deployer wallet `0xC8bfedCC…d310` so the on-chain trail
+forms a single-signer priority chain. If a different address emits `Notarized` for the same hash,
+it's still valid as *that* address's priority record but breaks the single-author story on
+`/priority`. Fund the deployer with enough xDAI to cover the notarize call (~5-10 gwei * 30k gas
+per doc, near-zero on mainnet).
