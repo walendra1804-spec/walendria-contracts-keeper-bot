@@ -205,6 +205,78 @@ server-side fetch from the app loops out through Cloudflare and back to the same
 restart walendria-app` cuts that hop entirely. Not blocking — noted here so future sessions don't need to
 re-derive it.
 
+## Mainnet deploy runbook (Gnosis, chain id 100)
+
+Chiado stays as the live staging deployment; mainnet is a **separate second deployment** that reuses the
+exact same contract source (395/395 tests + both Chiado fork tests green). The three big deltas from the
+Chiado flow — keep them straight or you deploy the wrong thing to the wrong chain.
+
+**Immutable-once-deployed decisions (set at deploy time, unchangeable):**
+- `MAX_TRANSACTION_VALUE=100000000000000000000` (100 xDAI). Same cap as Chiado — deliberate; raise only via
+  a fresh redeploy at a new address once population is large enough that the hardcap is limiting genuine
+  demand rather than just capping blast radius.
+- `DEVELOPER_ADDRESS` and `WITHDRAWAL_RECIPIENT` — **must be a wallet whose private key never touches the
+  VPS.** If left blank they fall back to `DEPLOYER_ADDRESS`, and if the deployer address is also the
+  keeper-bot's `PRIVATE_KEY` on the VPS (the Chiado pattern), then a VPS breach can call
+  `setWithdrawalRecipient(attacker)` and drain the pool. Use the user's laptop keystore address, or any
+  fresh wallet whose key is only ever entered locally, never on the server.
+- `SharedIB` still gets deployed by `script/Deploy.s.sol` (removing it would drift from the tested
+  bytecode), but the app **does not link to /shared-ib** in the mainnet NavBar (its only controller is the
+  deployer EOA — not mainnet-safe to promote as a feature). The route still resolves for anyone with the
+  direct URL.
+
+**Keys — three separate roles:**
+1. **Deployer** — the address that signs `forge script`. Needs ~0.1 xDAI on Gnosis mainnet for the 9-tx
+   deploy. Can be the existing `walendria-chiado` keystore (same address across chains); its key never has
+   to be redistributed post-deploy.
+2. **Revenue** — `DEVELOPER_ADDRESS` + `WITHDRAWAL_RECIPIENT`. Whichever laptop-only wallet the user
+   controls. Never funded on the VPS.
+3. **Keeper** — a **fresh** private key generated only for this role, funded with ~0.05 xDAI. Its `.env`
+   sits on the VPS; a breach of it costs at most that 0.05 xDAI + a temporarily-inactive keeper (poking is
+   permissionless — anyone else can still poke to resolve markets).
+
+**Gas floor is effectively zero on Gnosis mainnet too** (wallet-verified: base fee 0 gwei, priority 0.0001
+gwei is "very high"). So the Chiado deploy command's `--with-gas-price 1000000 --priority-gas-price 1000`
+(0.001 gwei / 1e-6 gwei) works identically on mainnet — it's 10x above wallet suggestion, still trivially
+cheap. `walendria-app/src/lib/onchain.ts`'s `LOW_GAS_FEES` is already guarded to only apply on Chiado; on
+mainnet it spreads to `{}` and wallets estimate normally, which handles any future base-fee spike
+automatically.
+
+**Deploy command (user runs, interactive keystore password):**
+```bash
+# In D:\walendria-contracts, fill .env with the three addresses above, then:
+forge script script/Deploy.s.sol:DeployScript --rpc-url gnosis --account walendria-chiado \
+  --broadcast --slow --with-gas-price 1000000 --priority-gas-price 1000
+```
+`--slow` is still mandatory (public RPC pool = same nonce-scramble risk if pipelined). If the deploy
+simulates with `CreateCollision`, `rm -rf ~/.foundry/cache/rpc/gnosis`.
+
+**Post-deploy checklist — same shape as Chiado, but chain id 100 not 10200:**
+1. Read `broadcast/Deploy.s.sol/100/run-latest.json` → 9 addresses + min-block `DEPLOYMENT_BLOCK`.
+2. Bytecode length check: `cast code <addr> --rpc-url gnosis` vs `out/<C>.sol/<C>.json` `deployedBytecode`
+   for all 9.
+3. Getter spot-checks with retries (`MIN_COMPLETION_WINDOW()`, `maxTransactionValue()`,
+   `LM.integrityBond()`, `SM.isController(DM/SC)`, `DM.listingManager()`,
+   `DeveloperPool.withdrawalRecipient()` — this last one must equal your revenue wallet, not the deployer).
+4. **Wire the four consumers** (each has its own `[gnosis.id]` slot ready — no code changes, just addresses):
+   - `walendria-app/src/lib/contracts.ts` → `CONTRACT_ADDRESSES[gnosis.id]` + `DEPLOYMENT_BLOCK[gnosis.id]`
+   - `keeper-bot/src/config.js` → flip `CHAIN` to `gnosis`, `RPC_URL` to `https://rpc.gnosischain.com`,
+     new `ADDRESSES`, new `DEPLOYMENT_BLOCK`
+   - **Flip `ACTIVE_CHAIN` in `walendria-app/src/lib/onchain.ts` from `gnosisChiado` to `gnosis`** — this
+     is the app-wide cutover switch; nothing routes to mainnet until this flips.
+   - Duplicate `test/fork/LiveChiadoLifecycle.t.sol` → `test/fork/LiveMainnetLifecycle.t.sol`, replace the
+     6 constant addresses and `vm.createSelectFork("chiado")` → `vm.createSelectFork("gnosis")`, run it.
+5. Verify contract source on `gnosis.blockscout.com` (free, no API key) for all 9 addresses — without an
+   audit, source verification is the only way users can inspect what they're trusting.
+6. VPS keeper cutover: generate fresh keeper key locally, fund the address with ~0.05 xDAI, `scp` new
+   `.env` (with `PRIVATE_KEY=<keeper key>`, `RPC_URL=https://rpc.gnosischain.com`), `rm data.json`,
+   `pm2 restart walendria-keeper --update-env`. Verify `curl localhost:4000/health` climbs past the
+   mainnet deploy block.
+7. VPS app cutover: rebuild + `pm2 restart walendria-app` (see "walendria.org — deploying the app to the
+   VPS" below — same tar-over-ssh flow, no other changes).
+8. Cross-check: `https://walendria.org` shows connected to Gnosis (not Chiado);
+   `https://indexer.walendria.org/health` returns the mainnet lastIndexedBlock.
+
 ## Conventions
 
 - **Auto-commit is pre-authorized** for both walendria-contracts and walendria-app — commit without asking.
