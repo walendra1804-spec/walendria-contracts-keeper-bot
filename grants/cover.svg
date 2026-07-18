@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" font-family="Arial, Helvetica, sans-serif">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="6%" r="72%">
+      <stop offset="0%" stop-color="#c9903f" stop-opacity="0.22"/>
+      <stop offset="55%" stop-color="#c9903f" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#c9903f" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="nameGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f7f3ea"/>
+      <stop offset="100%" stop-color="#d8cebb"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ground -->
+  <rect width="1600" height="900" fill="#0c0b09"/>
+  <rect width="1600" height="900" fill="url(#glow)"/>
+
+  <!-- certificate double frame -->
+  <rect x="46" y="46" width="1508" height="808" fill="none" stroke="#4a4030" stroke-width="2"/>
+  <rect x="58" y="58" width="1484" height="784" fill="none" stroke="#322a1e" stroke-width="1"/>
+
+  <!-- ghost "28" watermark -->
+  <text x="800" y="642" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="640" font-weight="700" fill="#e2ac5c" fill-opacity="0.05" letter-spacing="8">28</text>
+
+  <!-- wax-seal monogram -->
+  <circle cx="800" cy="176" r="52" fill="none" stroke="#4a4030" stroke-width="1"/>
+  <circle cx="800" cy="176" r="44" fill="none" stroke="#c9903f" stroke-width="2"/>
+  <text x="800" y="192" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="42" font-weight="700" fill="#e2ac5c">28</text>
+
+  <!-- eyebrow -->
+  <text x="800" y="280" text-anchor="middle" font-size="21" letter-spacing="7" fill="#a89f8c">TRUSTLESS COMMERCE &#183; BUILT ON GNOSIS CHAIN</text>
+
+  <!-- hero wordmark -->
+  <text x="800" y="410" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="146" font-weight="600" fill="url(#nameGrad)" letter-spacing="1">Walendria</text>
+
+  <!-- protocol subline -->
+  <text x="800" y="470" text-anchor="middle" font-size="25" letter-spacing="14" fill="#a89f8c">P R O T O C O L &#8212; THE 28</text>
+
+  <!-- accent divider -->
+  <line x1="740" y1="512" x2="860" y2="512" stroke="#c9903f" stroke-width="2"/>
+
+  <!-- vertical split between the two questions -->
+  <line x1="800" y1="556" x2="800" y2="706" stroke="#322a1e" stroke-width="1"/>
+
+  <!-- left: question one -->
+  <text x="432" y="590" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="33" fill="#f3efe6">
+    <tspan x="432" dy="0">How do I get</tspan>
+    <tspan x="432" dy="42">my money back?</tspan>
+  </text>
+  <text x="432" y="676" text-anchor="middle" font-size="20" letter-spacing="4" fill="#e2ac5c">INTEGRITY BOND</text>
+
+  <!-- right: question two -->
+  <text x="1168" y="590" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="33" fill="#f3efe6">
+    <tspan x="1168" dy="0">Who decides</tspan>
+    <tspan x="1168" dy="42">what&#39;s true?</tspan>
+  </text>
+  <text x="1168" y="676" text-anchor="middle" font-size="20" letter-spacing="4" fill="#e2ac5c">SPECTRAL MARKET</text>
+
+  <!-- footer -->
+  <text x="800" y="812" text-anchor="middle" font-size="19" letter-spacing="3" fill="#6d6555">walendria.org      &#183;      Immutable &amp; open-source (MIT)      &#183;      No admin keys</text>
+</svg>
