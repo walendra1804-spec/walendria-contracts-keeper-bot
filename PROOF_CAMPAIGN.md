@@ -1,9 +1,10 @@
 # Proof campaign runbook
 
 The protocol is live on Gnosis mainnet and, as of the last check, has **zero** transactions through it.
-That is the honest starting line. This runbook turns it into a track record: roughly ten settled
+That is the honest starting line. This runbook turns it into a track record: a handful of settled
 transactions plus at least one dispute driven all the way to a verdict, published at
 [walendria.org/track-record](https://walendria.org/track-record) with the transaction hash for every one.
+It is scripted end to end — two commands, one keystore prompt each.
 
 Why this and not marketing: Walendria has no paid audit and no brand. The only claim it can make that a
 stranger has any reason to believe is one they can re-derive from the chain themselves. Everything below
@@ -32,8 +33,15 @@ significant figures. The contracts impose almost no floor either: ListingManager
 DisputeManager only `price / 2 == 0`. So **P is genuinely a free choice**, and the capital line of the budget
 is whatever you decide it is. Pick P by what you can put up; the protocol does not care.
 
-**One bond covers every honest transaction** if they run sequentially — it unlocks on each settlement and is
-immediately reusable. There is never a need to fund 10 × 1.5P.
+**One bond covers every honest transaction** — but not for the reason it first appears. `confirmCompletion`
+recycles the slot to `Empty` and deliberately *leaves the bond locked*, because that slot is still on offer
+to the next buyer: Locked IB backs an open listing slot, not an individual sale, and is only released by
+`closeListing`/`reduceSlots`. So ten separate listings would demand ten simultaneous 1.5P locks.
+
+The structure that actually works is **one listing with one slot, sold over and over**. Each payment bumps
+the slot's `cycle`, so every sale still gets its own distinct dispute market, and the whole campaign runs on
+a single 1.5P lock. That is also the more faithful demonstration — a real seller lists a thing once and sells
+it repeatedly, which is precisely what the slot-recycling design exists for.
 
 **And almost all of it comes back.** When one operator holds every role in a rehearsal, the outlay unwinds,
 and the part that doesn't — the 0.5% Developer Fee and any swept market surplus — routes to the Developer
@@ -55,36 +63,29 @@ bytecode:
 | `pokeSettlement` | 56,225 |
 | `finalizeDispute` | 44,575 |
 | `redeem` | 35,140 |
-| **one honest transaction** (create + pay + confirm) | **401,585** |
-| **one full dispute** (create + pay + fund + 3 buys + poke + finalize + redeem) | **1,376,986** |
-
-Which gives three campaign shapes:
-
-| shape | gas |
-|---|---|
-| **A — full**: 10 honest + 1 dispute | 5,426,413 |
-| **B — lean**: 3 honest + 1 dispute | 2,615,318 |
-| **C — minimum**: 1 honest + 1 dispute | 1,812,148 |
+| **one honest transaction** on a reused slot (pay + confirm) | **161,451** |
+| plus, once per campaign: `deposit` + `createListing` | 273,711 |
 
 ### Putting it together
 
-Total ≈ `4.966 × P` (returns) + `gas × gasPrice` (spent). Gnosis mainnet base fee sits near zero — it was
-**85,216 wei/gas** when this was written, i.e. 0.000085 gwei — so at base fee, shape B costs about
-**0.00022 xDAI** in gas and shape A about **0.00046 xDAI**.
+Total ≈ `4.966 × P` (returns) + `gas × gasPrice` (spent), and the second term is the one that rounds to
+nothing. Simulating phase 1 of the campaign script — three honest sales plus a dispute opened and pushed
+past 93% — against live mainnet state, `forge` estimated **2,747,002 gas at 0.000004522 gwei**, i.e. a total
+of **0.0000000124 xDAI**. Phase 2 adds roughly a further 250,000 gas.
 
-| P | peak capital | + gas (shape B, at base fee) | total to have on hand |
-|---|---|---|---|
-| 0.00005 | 0.00025 | 0.00022 | **~0.0005** |
-| 0.001 | 0.0050 | 0.00022 | **~0.005** |
-| 0.01 | 0.0497 | 0.00022 | **~0.05** |
-| 0.1 | 0.497 | 0.00022 | **~0.5** |
-| 1 | 4.97 | 0.00022 | **~5** |
+So gas is genuinely not a line item on Gnosis; the budget is the capital, and the capital comes back:
 
-> **Set the gas price manually.** The app deliberately does not force a low gas price on mainnet
-> (`LOW_GAS_FEES` in `walendria-app/src/lib/onchain.ts` is guarded to Chiado, so a future base-fee spike is
-> handled by the wallet automatically). That means your wallet picks, and wallets routinely suggest ~1 gwei
-> on Gnosis — which is over 10,000× the actual base fee and turns shape B's gas from 0.00022 into 0.0026
-> xDAI. Open the advanced gas controls and set something just above base fee.
+| P | peak capital | total to have on hand |
+|---|---|---|
+| 0.00005 | 0.00025 | **~0.0003** |
+| 0.001 | 0.0050 | **~0.005** |
+| 0.01 | 0.0497 | **~0.05** |
+| 0.1 | 0.497 | **~0.5** |
+| 1 | 4.97 | **~5** |
+
+The fork test confirms where the money ends up. Across four sales at P = 0.00005, the operator's balance
+fell by exactly **4 × 0.5% × P** — the Developer Fee on each sale, which for a self-operated rehearsal lands
+in the operator's own Developer Pool. Every other wei came back through redemption and the bond claim.
 
 > Re-run any of these measurements with:
 > ```bash
@@ -93,10 +94,10 @@ Total ≈ `4.966 × P` (returns) + `gas × gasPrice` (spent). Gnosis mainnet bas
 
 ---
 
-### Which shape to run
+### Which P to run at
 
-Run whichever you can fund **today**, not the one you can fund eventually. Every shape produces real
-transaction hashes on mainnet and exercises the same code paths; the only thing P changes is how much a
+Pick the one you can fund **today**, not the one you could fund eventually. Every size produces real
+transaction hashes on mainnet and exercises identical code paths; the only thing P changes is how much a
 sceptic can say the amounts were trivial.
 
 There is a real answer to that objection, and it should be given rather than dodged: the protocol's
@@ -108,83 +109,82 @@ A dispute run at a tiny P and published honestly beats a large one that never ha
 later, run it again at a bigger P — the track record accumulates, and a second entry at a larger size is
 itself evidence that the first was not a fluke.
 
-## 2. Wallets
+## 2. Running it
 
-| Role | Who | Needs |
-|---|---|---|
-| **Seller** | deployer wallet `0xC8bfedCC…d310` | 1.5 × P for the bond |
-| **Buyer** | a second wallet you control, or a friend's | P per purchase (returns to seller) |
-| **Dispute counterparty** | your own second wallet | ~2.5 × P for the guilty side + the push |
+`script/live/ProofCampaign.s.sol` runs the whole thing as two broadcasts. **You run them** — the keystore
+password is entered interactively, never passed on a command line or into a chat.
 
-Use a friend's wallet as buyer wherever a friend is actually willing — a distinct address on the other side
-is stronger evidence than one you control, even when disclosed. For the **dispute**, expect to hold both
-sides yourself: it needs ~5 × P and one side is designed to lose. Asking someone to fund a losing position
-as a favour is not a reasonable thing to ask.
+### Phase 1 — bond, honest sales, dispute opened and pushed past 93%
 
-**Every one of these choices gets disclosed.** See section 5 — it is not optional, and it is the reason the
-record is worth anything.
+```bash
+CAMPAIGN_PRICE=50000000000000 CAMPAIGN_HONEST_COUNT=3 \
+forge script script/live/ProofCampaign.s.sol:ProofCampaignPhase1 \
+  --rpc-url gnosis --account walendria-chiado --broadcast --slow
+```
+
+`CAMPAIGN_PRICE` is P in wei (the example is 0.00005 xDAI). `--slow` is mandatory: the public RPC pool
+scrambles nonces if forge pipelines transactions.
+
+Before spending anything the script checks the wallet covers the peak, so an underfunded run fails costing
+nothing rather than halfway through leaving a half-open dispute nobody can finish. At the end it prints the
+listing id and asserts the Guilty price actually crossed 93% — a failure surfaces there, not an hour later.
+
+### Wait ~1 hour
+
+The Spectral Market resolves only after one side holds ≥93% for a *cumulative* hour. The clock pauses the
+moment anyone bets back and never loses time already banked, so an hour of quiet is an hour banked. This is
+a protocol property, not a scripting limitation — nothing collapses it into one transaction.
+
+### Phase 2 — resolve, finalize, collect
+
+```bash
+CAMPAIGN_LISTING_ID=<id printed by phase 1> \
+forge script script/live/ProofCampaign.s.sol:ProofCampaignPhase2 \
+  --rpc-url gnosis --account walendria-chiado --broadcast --slow
+```
+
+Pokes settlement (skipping it gracefully if the keeper bot got there first), finalizes the dispute, claims
+the slashed bond — restitution is a *pull* payment, so it does have to be claimed — and redeems the winning
+shares.
+
+### What it does, and why that shape
+
+One listing, one slot, sold `CAMPAIGN_HONEST_COUNT` times and then disputed on the final sale. One address
+plays both buyer and seller: in a rehearsal it is the same operator either way, and deriving throwaway
+identities would make the on-chain trail *look* like two strangers while changing nothing about who is
+behind it. Each listing states the arrangement in its own on-chain description, which is a firmer
+disclosure than a note on a web page anyone could edit later.
+
+### It is tested before it spends anything
+
+- `test/fork/ProofCampaign.t.sol` inherits the script's own `_phase1`/`_phase2` and runs the complete arc
+  against a Gnosis mainnet fork — including the hour, via `vm.warp`. The code exercised is the code that
+  broadcasts. It asserts the market resolves Guilty, the dispute finalizes, nothing is left unclaimed or
+  unredeemed, and net capital consumed stays below 0.5 × P.
+- Phase 1 can also be dry-run against real live state, as your real address, before committing:
+  ```bash
+  CAMPAIGN_PRICE=50000000000000 forge script script/live/ProofCampaign.s.sol:ProofCampaignPhase1 \
+    --rpc-url gnosis --sender 0xC8bfedCC142b0C915CA83E214a71d6607C89d310
+  ```
+  No `--broadcast`, so nothing is sent; it reports the gas and whether the threshold would be crossed.
+
+### Optional: the expired-window variant
+
+Worth doing once, separately, because it proves the seller-protection path: pay for a slot, let the 72-hour
+window lapse without confirming, then call `finalizeExpiredSlot` from `/listings/<id>/slots`. That emits
+`SlotFinalized` instead of `SlotCompleted` and demonstrates that a buyer who simply goes silent cannot
+strand the seller's bond. It costs three days of waiting and a second 1.5P lock, so it is left out of the
+script rather than made to hold up the rest.
+
+### Report what actually happens
+
+Including the unflattering parts. If a redemption comes back short of 1:1 per share because the pool was
+thin, say so — that is the documented LMSR shortfall, not a bug, and a record that only reports good
+outcomes is not evidence of anything.
 
 ---
 
-## 3. Part A — ten honest transactions
-
-Each cycle is roughly two minutes of clicking. The completion window has a 72-hour floor, but a buyer can
-confirm receipt immediately, so **the whole set can be done in one sitting** — no waiting required.
-
-**Once, at the start:**
-
-1. `/integrity-bond` → **Deposit** → 1.5 × P. This is the only capital that stays locked across the run.
-
-**Then repeat ten times:**
-
-2. `/sell` → fill price = P, slots = 1, completion window = 72h (the minimum), a real title and description
-   → **Create listing**. Note the listing id.
-3. Switch to the buyer wallet → `/pay/<listingId>` → **Pay listing `<id>`**.
-   *This emits `Settled` — the event the track record counts as a transaction.*
-4. Still as buyer → `/purchases` → **Confirm receipt & release bond**.
-   *This emits `SlotCompleted` and unlocks the bond, freeing it for the next cycle.*
-
-Vary the price across the ten rather than repeating one number — a record of ten identical transactions
-reads as a script, which is exactly what it would be.
-
-**Do at least one differently:** let a single slot's 72-hour window lapse without confirming, then call
-`finalizeExpiredSlot` from `/listings/<id>/slots`. That produces a `SlotFinalized` instead of a
-`SlotCompleted`, and proves the seller-protection path works — that a buyer who simply goes silent cannot
-strand the seller's bond. It costs three days of waiting, so start it early and run the other nine while it
-matures.
-
----
-
-## 4. Part B — one dispute, all the way to a verdict
-
-This is the part that actually matters. Anyone can build an escrow that works when everyone is honest; the
-entire claim of this protocol is what happens when they are not.
-
-1. **Set it up.** Create a listing at price P and pay for it from the buyer wallet, exactly as above — but
-   do **not** confirm receipt.
-2. **Open the dispute.** As buyer, go to `/disputes/<listingId>/<slotIndex>` → **Fund Guilty side** →
-   0.5 × P. The Spectral Market opens once the guilty side is funded; the matching 0.5P on the innocent side
-   comes from the seller's locked bond.
-3. **Submit evidence.** On the same page, upload a document through the evidence panel → **Submit evidence**.
-   A dispute with no evidence attached is a weaker artifact than one with it, and this exercises
-   EvidenceRegistry + IPFS end to end.
-4. **Push the market.** In the trade panel choose **Guilty** and **Buy Guilty shares**. Budget ~1.97 × P;
-   buy in two or three steps and watch the price bar rather than sending one large order.
-5. **Wait out the clock.** The Guilty side must hold ≥93% for a *cumulative* hour. The clock pauses the
-   moment anyone bets back and never loses time already banked, so an hour of quiet is an hour banked.
-6. **Poke.** `/claim` → **Poke settlement**. Permissionless — the keeper bot may well beat you to it, which
-   is itself worth noting in the record when it happens.
-7. **Finalize.** Back on the dispute page → **Finalize dispute**. This emits `DisputeFinalized` with the
-   winning side, slashes the bond to the buyer, and is the single most load-bearing row on the whole page.
-8. **Redeem.** `/claim` → **Redeem** on the winning position. Expect ~2.97 × P back.
-
-Note honestly whatever actually happens, including the parts that are unflattering. If the redemption comes
-back short of 1:1 per share because the pool was thin, say so — that is the documented LMSR shortfall, not a
-bug, and a record that only reports the good outcomes is not evidence of anything.
-
----
-
-## 5. Part C — publish it honestly
+## 3. Publish it honestly
 
 The chain proves a transaction happened. It cannot prove the two sides were strangers, and for this campaign
 most of them are not. A reader will check the addresses within a minute of caring, and a record that quietly
@@ -217,7 +217,7 @@ Then:
 
 ---
 
-## 6. Where this leaves the argument
+## 4. Where this leaves the argument
 
 Ten settled transactions is not adoption and this document should not pretend otherwise. What it *is*:
 proof that every path in the protocol works against real money on a real chain, that a dispute reaches a
