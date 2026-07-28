@@ -233,12 +233,48 @@ Then:
 
 ---
 
-## 4. Where this leaves the argument
+## 4. The first run — what it actually cost, 2026-07-28
 
-Ten settled transactions is not adoption and this document should not pretend otherwise. What it *is*:
-proof that every path in the protocol works against real money on a real chain, that a dispute reaches a
-verdict without a court, and that the project publishes its own history including the parts that don't
-flatter it.
+Executed on Gnosis mainnet at P = 0.00005 xDAI: listing 0, one slot sold four times, the fourth disputed
+and carried to a verdict. Every figure below is read back off the chain, not projected.
+
+| | wei | note |
+|---|---|---|
+| Balance before phase 1 | 599,901,665,102,212 | |
+| Balance after phase 2 | 598,826,851,761,826 | |
+| **Net consumed** | **1,074,813,340,386** | ≈ 0.00000107 xDAI |
+| — Developer Fee, 4 × 0.5% × P | 1,000,000,000,000 | sitting in the operator's own DeveloperPool |
+| — Phase 1 gas (11 txs) | 74,673,531,735 | |
+| — Phase 2 gas (3 txs) | 139,808,651 | |
+
+Those three lines sum to the net consumed exactly, to the wei — nothing leaked. The only genuinely spent
+figure is the gas: **74,813,340,386 wei**, about 0.0000748 xDAI for the entire campaign. The Developer Fee
+is recoverable, and the capital (bond, payments, market stake) all round-tripped: final Integrity Bond
+`total = locked = 0`, `claimable = 0`, no unredeemed shares.
+
+Three things the run established that no simulation could:
+
+1. **The bond stays locked through `confirmCompletion`.** After three honest sales the bond read
+   `total = locked = 50000000000000`, `freeIB = 0`. The fork test asserted this; mainnet confirmed it.
+2. **The keeper bot resolved the market on its own.** Phase 2 printed *"already resolved (the keeper bot
+   got there first)"* — the unattended poke loop beat the operator to it. That path matters far more than
+   the rehearsed ones, because a stranger's dispute depends on exactly it.
+3. **Restitution moved.** The Guilty verdict slashed `perSlotLocked - price/2` = P out of the seller's bond
+   and credited it to the buyer, collected via `claim()`.
+
+The gas price observed during the run was **0.000000674 gwei** on phase 2 — two orders of magnitude below
+even the phase 1 estimate. Gas is not a budget line on Gnosis.
+
+## 5. Where this leaves the argument
+
+Four settled transactions between one wallet and itself is not adoption, and neither this document nor the
+track-record page should pretend otherwise — both say so on the record. What it *is*: proof that every path
+in the protocol works against real money on a real chain, that a dispute reaches a verdict without a court
+and without the developer's hand on the resolution, and that the project publishes its own history
+including the parts that don't flatter it.
 
 That is the smallest artifact that makes the next conversation possible — the one where someone who has no
 reason to trust you can check for themselves in two minutes instead of taking a whitepaper on faith.
+
+The obvious next step is a transaction where the counterparty is genuinely not the developer. Everything
+above is scaffolding for that one.
