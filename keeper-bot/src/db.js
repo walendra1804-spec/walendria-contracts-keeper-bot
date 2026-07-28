@@ -14,7 +14,16 @@ const DB_PATH = process.env.DB_PATH || path.join(__dirname, "..", "data.json");
  * the bottleneck — not expected for a long time at this deployment's actual usage.
  */
 function emptyState() {
-  return { meta: {}, listings: {}, disputes: {}, marketEvents: {}, evidence: {} };
+  return {
+    meta: {},
+    listings: {},
+    disputes: {},
+    marketEvents: {},
+    evidence: {},
+    settlements: {},
+    completions: {},
+    resolutions: {},
+  };
 }
 
 function load() {
@@ -75,6 +84,48 @@ export function insertEvidence(records) {
     state.evidence[key] = r;
   }
   persist();
+}
+
+/**
+ * The three buckets below back the public track record (walendria-app /track-record). They are keyed by the
+ * log's own identity (block + logIndex) rather than by listing/market id, because unlike `listings` — where a
+ * later record for the same id is a legitimate overwrite — every one of these is a distinct historical fact
+ * that must accumulate: one slot can be paid, completed, re-paid and disputed across several cycles, and
+ * collapsing those onto one key would silently shrink the very record it exists to prove.
+ */
+export function insertSettlements(records) {
+  if (records.length === 0) return;
+  for (const r of records) state.settlements[`${r.blockNumber}:${r.logIndex}`] = r;
+  persist();
+}
+
+export function insertCompletions(records) {
+  if (records.length === 0) return;
+  for (const r of records) state.completions[`${r.blockNumber}:${r.logIndex}`] = r;
+  persist();
+}
+
+export function insertResolutions(records) {
+  if (records.length === 0) return;
+  for (const r of records) state.resolutions[`${r.blockNumber}:${r.logIndex}`] = r;
+  persist();
+}
+
+function byBlockThenLogIndex(a, b) {
+  const blockDiff = Number(BigInt(a.blockNumber) - BigInt(b.blockNumber));
+  return blockDiff !== 0 ? blockDiff : a.logIndex - b.logIndex;
+}
+
+export function getSettlements() {
+  return Object.values(state.settlements).sort(byBlockThenLogIndex);
+}
+
+export function getCompletions() {
+  return Object.values(state.completions).sort(byBlockThenLogIndex);
+}
+
+export function getResolutions() {
+  return Object.values(state.resolutions).sort(byBlockThenLogIndex);
 }
 
 export function getListings(seller) {

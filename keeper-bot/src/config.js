@@ -38,10 +38,21 @@ export const ADDRESSES = {
   settlementConditions: "0xd07B2bEFB8590A861f8D6c1eF8AFb39c89197509",
   disputeManager: "0x75ba345B89A9653C98E38958d84359A6cE9233b6",
   evidenceRegistry: "0x0002B137e4bCd744F121C40A78AD49290ed8025e",
+  settlement: "0x301690a2Dd9A95ca7EBE4CC457Cd0024201c5AB0",
 };
 
 export const listingManagerAbi = parseAbi([
   "event ListingCreated(uint256 indexed listingId, address indexed seller, uint256 price, uint256 totalSlots, uint256 completionWindow, uint256 perSlotLocked)",
+  // The two mutually-exclusive honest endings of a paid slot, indexed for the public track record: the buyer
+  // actively confirming delivery, or the completion window lapsing with no dispute filed. Both mean the same
+  // thing economically (seller keeps the proceeds, bond unlocks) but they are very different as evidence, so
+  // the record keeps them distinct rather than collapsing them into one "completed" count.
+  "event SlotCompleted(uint256 indexed listingId, uint256 indexed slotIndex, address indexed buyer, uint256 cycle)",
+  "event SlotFinalized(uint256 indexed listingId, uint256 indexed slotIndex, uint256 cycle)",
+]);
+
+export const settlementAbi = parseAbi([
+  "event Settled(uint256 indexed listingId, uint256 indexed slotIndex, address indexed buyer, uint256 price, uint256 fee, uint256 excessRefunded)",
 ]);
 
 export const spectralMarketAbi = parseAbi([
@@ -60,6 +71,7 @@ export const settlementConditionsAbi = parseAbi([
 
 export const disputeManagerAbi = parseAbi([
   "event DisputeOpened(uint256 indexed marketId, uint256 indexed listingId, uint256 indexed slotIndex, address seller, uint256 halfPrice)",
+  "event DisputeFinalized(uint256 indexed marketId, uint8 winningSide, uint256 remainingLocked)",
 ]);
 
 export const evidenceRegistryAbi = parseAbi([

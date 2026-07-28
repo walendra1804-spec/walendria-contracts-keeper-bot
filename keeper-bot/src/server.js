@@ -1,6 +1,15 @@
 import { createServer } from "node:http";
 import { HTTP_PORT } from "./config.js";
-import { getListings, getDisputes, getMarketEvents, getEvidence, getMeta } from "./db.js";
+import {
+  getListings,
+  getDisputes,
+  getMarketEvents,
+  getEvidence,
+  getMeta,
+  getSettlements,
+  getCompletions,
+  getResolutions,
+} from "./db.js";
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}] [server]`, ...args);
@@ -38,6 +47,20 @@ export function startServer() {
 
       if (url.pathname === "/events/disputes") {
         return sendJson(res, 200, getDisputes());
+      }
+
+      // Single aggregate route rather than three thin ones: the public track record renders all of these
+      // together on one page, and three sequential server-side fetches would triple the latency of the one
+      // page whose whole job is to load fast enough that a sceptic actually reads it. `lastIndexedBlock`
+      // rides along so the page can state how current the record is instead of implying it is live.
+      if (url.pathname === "/events/track-record") {
+        return sendJson(res, 200, {
+          settlements: getSettlements(),
+          completions: getCompletions(),
+          resolutions: getResolutions(),
+          disputes: getDisputes(),
+          lastIndexedBlock: getMeta("lastIndexedBlock", null),
+        });
       }
 
       const marketTradesMatch = url.pathname.match(/^\/events\/market\/(\d+)\/trades$/);

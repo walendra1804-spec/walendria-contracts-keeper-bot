@@ -6,6 +6,7 @@ import {
   disputeManagerAbi,
   evidenceRegistryAbi,
   listingManagerAbi,
+  settlementAbi,
   spectralMarketAbi,
 } from "./config.js";
 import {
@@ -15,6 +16,9 @@ import {
   insertDisputes,
   insertMarketEvents,
   insertEvidence,
+  insertSettlements,
+  insertCompletions,
+  insertResolutions,
 } from "./db.js";
 
 const listingCreatedEvent = getAbiItem({ abi: listingManagerAbi, name: "ListingCreated" });
@@ -23,13 +27,28 @@ const marketOpenedEvent = getAbiItem({ abi: spectralMarketAbi, name: "MarketOpen
 const boughtEvent = getAbiItem({ abi: spectralMarketAbi, name: "Bought" });
 const soldEvent = getAbiItem({ abi: spectralMarketAbi, name: "Sold" });
 const evidenceSubmittedEvent = getAbiItem({ abi: evidenceRegistryAbi, name: "EvidenceSubmitted" });
+const settledEvent = getAbiItem({ abi: settlementAbi, name: "Settled" });
+const slotCompletedEvent = getAbiItem({ abi: listingManagerAbi, name: "SlotCompleted" });
+const slotFinalizedEvent = getAbiItem({ abi: listingManagerAbi, name: "SlotFinalized" });
+const disputeFinalizedEvent = getAbiItem({ abi: disputeManagerAbi, name: "DisputeFinalized" });
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}] [indexer]`, ...args);
 }
 
 async function indexChunk(publicClient, fromBlock, toBlock) {
-  const [listingLogs, disputeLogs, openedLogs, boughtLogs, soldLogs, evidenceLogs] = await Promise.all([
+  const [
+    listingLogs,
+    disputeLogs,
+    openedLogs,
+    boughtLogs,
+    soldLogs,
+    evidenceLogs,
+    settledLogs,
+    completedLogs,
+    finalizedLogs,
+    resolutionLogs,
+  ] = await Promise.all([
     publicClient.getLogs({ address: ADDRESSES.listingManager, event: listingCreatedEvent, fromBlock, toBlock }),
     publicClient.getLogs({ address: ADDRESSES.disputeManager, event: disputeOpenedEvent, fromBlock, toBlock }),
     publicClient.getLogs({ address: ADDRESSES.spectralMarket, event: marketOpenedEvent, fromBlock, toBlock }),
@@ -41,6 +60,10 @@ async function indexChunk(publicClient, fromBlock, toBlock) {
       fromBlock,
       toBlock,
     }),
+    publicClient.getLogs({ address: ADDRESSES.settlement, event: settledEvent, fromBlock, toBlock }),
+    publicClient.getLogs({ address: ADDRESSES.listingManager, event: slotCompletedEvent, fromBlock, toBlock }),
+    publicClient.getLogs({ address: ADDRESSES.listingManager, event: slotFinalizedEvent, fromBlock, toBlock }),
+    publicClient.getLogs({ address: ADDRESSES.disputeManager, event: disputeFinalizedEvent, fromBlock, toBlock }),
   ]);
 
   if (listingLogs.length > 0) {
@@ -57,6 +80,21 @@ async function indexChunk(publicClient, fromBlock, toBlock) {
     );
   }
 
+  const marketLogs = [...openedLogs, ...boughtLogs, ...soldLogs];
+  const trackRecordLogs = [...settledLogs, ...completedLogs, ...finalizedLogs, ...resolutionLogs];
+  const blockTimestampLogs = [...marketLogs, ...evidenceLogs, ...trackRecordLogs, ...disputeLogs];
+  let timestampByBlock = new Map();
+  if (blockTimestampLogs.length > 0) {
+    const uniqueBlocks = Array.from(new Set(blockTimestampLogs.map((l) => l.blockNumber.toString()))).map((s) =>
+      BigInt(s)
+    );
+    const blocks = await Promise.all(uniqueBlocks.map((bn) => publicClient.getBlock({ blockNumber: bn })));
+    timestampByBlock = new Map(uniqueBlocks.map((bn, i) => [bn.toString(), Number(blocks[i].timestamp)]));
+  }
+
+  // Inserted after the timestamp map is built (rather than alongside the listings above) so a dispute row
+  // carries the same txHash + timestamp as every other track-record row — a dispute is the single most
+  // load-bearing entry in the public record, and it would be the odd one out with no link to click.
   if (disputeLogs.length > 0) {
     insertDisputes(
       disputeLogs.map((l) => ({
@@ -66,19 +104,10 @@ async function indexChunk(publicClient, fromBlock, toBlock) {
         seller: l.args.seller,
         halfPrice: l.args.halfPrice.toString(),
         blockNumber: l.blockNumber.toString(),
+        txHash: l.transactionHash,
+        timestamp: timestampByBlock.get(l.blockNumber.toString()),
       }))
     );
-  }
-
-  const marketLogs = [...openedLogs, ...boughtLogs, ...soldLogs];
-  const blockTimestampLogs = [...marketLogs, ...evidenceLogs];
-  let timestampByBlock = new Map();
-  if (blockTimestampLogs.length > 0) {
-    const uniqueBlocks = Array.from(new Set(blockTimestampLogs.map((l) => l.blockNumber.toString()))).map((s) =>
-      BigInt(s)
-    );
-    const blocks = await Promise.all(uniqueBlocks.map((bn) => publicClient.getBlock({ blockNumber: bn })));
-    timestampByBlock = new Map(uniqueBlocks.map((bn, i) => [bn.toString(), Number(blocks[i].timestamp)]));
   }
 
   if (marketLogs.length > 0) {
@@ -132,11 +161,74 @@ async function indexChunk(publicClient, fromBlock, toBlock) {
     );
   }
 
+  // Track-record events. Every record carries its own txHash: the whole point of the public record is that a
+  // reader can click through to the block explorer and confirm the claim independently, so a row without a
+  // verifiable transaction behind it would be exactly the kind of unfalsifiable assertion this replaces.
+  if (settledLogs.length > 0) {
+    insertSettlements(
+      settledLogs.map((l) => ({
+        listingId: l.args.listingId.toString(),
+        slotIndex: l.args.slotIndex.toString(),
+        buyer: l.args.buyer,
+        price: l.args.price.toString(),
+        fee: l.args.fee.toString(),
+        blockNumber: l.blockNumber.toString(),
+        logIndex: l.logIndex,
+        txHash: l.transactionHash,
+        timestamp: timestampByBlock.get(l.blockNumber.toString()),
+      }))
+    );
+  }
+
+  if (completedLogs.length > 0 || finalizedLogs.length > 0) {
+    insertCompletions([
+      ...completedLogs.map((l) => ({
+        listingId: l.args.listingId.toString(),
+        slotIndex: l.args.slotIndex.toString(),
+        cycle: l.args.cycle.toString(),
+        // "confirmed" = the buyer actively called confirmCompletion; "expired" = the completion window ran
+        // out with no dispute. Distinct evidence, so the kind is carried rather than inferred later.
+        kind: "confirmed",
+        buyer: l.args.buyer,
+        blockNumber: l.blockNumber.toString(),
+        logIndex: l.logIndex,
+        txHash: l.transactionHash,
+        timestamp: timestampByBlock.get(l.blockNumber.toString()),
+      })),
+      ...finalizedLogs.map((l) => ({
+        listingId: l.args.listingId.toString(),
+        slotIndex: l.args.slotIndex.toString(),
+        cycle: l.args.cycle.toString(),
+        kind: "expired",
+        buyer: null,
+        blockNumber: l.blockNumber.toString(),
+        logIndex: l.logIndex,
+        txHash: l.transactionHash,
+        timestamp: timestampByBlock.get(l.blockNumber.toString()),
+      })),
+    ]);
+  }
+
+  if (resolutionLogs.length > 0) {
+    insertResolutions(
+      resolutionLogs.map((l) => ({
+        marketId: l.args.marketId.toString(),
+        winningSide: Number(l.args.winningSide),
+        remainingLocked: l.args.remainingLocked.toString(),
+        blockNumber: l.blockNumber.toString(),
+        logIndex: l.logIndex,
+        txHash: l.transactionHash,
+        timestamp: timestampByBlock.get(l.blockNumber.toString()),
+      }))
+    );
+  }
+
   return {
     listings: listingLogs.length,
     disputes: disputeLogs.length,
     marketEvents: marketLogs.length,
     evidence: evidenceLogs.length,
+    trackRecord: trackRecordLogs.length,
   };
 }
 
@@ -153,6 +245,7 @@ export async function runIndexer(publicClient) {
   let totalDisputes = 0;
   let totalMarketEvents = 0;
   let totalEvidence = 0;
+  let totalTrackRecord = 0;
 
   while (from <= head) {
     const to = from + INDEX_CHUNK_SIZE - 1n > head ? head : from + INDEX_CHUNK_SIZE - 1n;
@@ -161,13 +254,14 @@ export async function runIndexer(publicClient) {
     totalDisputes += result.disputes;
     totalMarketEvents += result.marketEvents;
     totalEvidence += result.evidence;
+    totalTrackRecord += result.trackRecord;
     setMeta("lastIndexedBlock", to.toString());
     from = to + 1n;
   }
 
-  if (totalListings || totalDisputes || totalMarketEvents || totalEvidence) {
+  if (totalListings || totalDisputes || totalMarketEvents || totalEvidence || totalTrackRecord) {
     log(
-      `Indexed up to block ${head}: +${totalListings} listing(s), +${totalDisputes} dispute(s), +${totalMarketEvents} market event(s), +${totalEvidence} evidence submission(s).`
+      `Indexed up to block ${head}: +${totalListings} listing(s), +${totalDisputes} dispute(s), +${totalMarketEvents} market event(s), +${totalEvidence} evidence submission(s), +${totalTrackRecord} track-record event(s).`
     );
   }
 }
