@@ -14,8 +14,8 @@ exists to produce exactly that, and nothing that only *looks* like it.
 ## 1. What it costs
 
 Measured against the live mainnet bytecode by `test/fork/MainnetCampaignCost.t.sol`, not estimated on paper.
-Every figure is a multiple of `P`, the listing price you choose — the ratios held identical at P = 0.1, 1 and
-10 xDAI, so **P is a free choice**. Pick it by what you can put up, not by what the protocol needs.
+
+### Capital: a multiple of P, and P is yours to choose
 
 | | multiple of P |
 |---|---|
@@ -23,28 +23,90 @@ Every figure is a multiple of `P`, the listing price you choose — the ratios h
 | Buyer's payment | 1.0 × P |
 | Opening the dispute market (0.5P per side) | 0.5 × P |
 | Pushing the market past the 93% threshold | 1.97 × P |
-| **Peak capital that must be liquid at one moment** | **4.97 × P** |
-| Winner redeems back afterwards | 2.97 × P |
+| **Peak capital that must be liquid at one moment** | **4.966 × P** |
+| Winner redeems back afterwards | 2.966 × P |
 
-Two things follow.
+`test_Fork_SmallestViablePrice` sweeps P across **seven orders of magnitude** — 0.000001, 0.00001, 0.0001,
+0.001 and 0.01 xDAI — and the ratio comes back as `4.96616574718` at every single one, identical to fifteen
+significant figures. The contracts impose almost no floor either: ListingManager rejects only `price == 0`,
+DisputeManager only `price / 2 == 0`. So **P is genuinely a free choice**, and the capital line of the budget
+is whatever you decide it is. Pick P by what you can put up; the protocol does not care.
 
-**The binding constraint is peak liquidity, not loss.** When one operator holds every role in a rehearsal,
-almost all of the outlay unwinds, and the part that doesn't — the 0.5% Developer Fee and any swept market
-surplus — routes to the Developer Pool, which is the same operator again. Net cost of the whole campaign is
-essentially gas, and gas on Gnosis rounds to nothing.
+**One bond covers every honest transaction** if they run sequentially — it unlocks on each settlement and is
+immediately reusable. There is never a need to fund 10 × 1.5P.
 
-**One bond covers all ten honest transactions** if they run sequentially: the bond unlocks on each
-settlement and is immediately reusable. There is no need to fund 10 × 1.5P.
+**And almost all of it comes back.** When one operator holds every role in a rehearsal, the outlay unwinds,
+and the part that doesn't — the 0.5% Developer Fee and any swept market surplus — routes to the Developer
+Pool, which is the same operator again.
 
-So at **P = 1 xDAI, budget ~5 xDAI** and expect nearly all of it back. Run the honest transactions first and
-the dispute last, and the 5 never has to be split.
+### Gas: the part that is actually spent
 
-> Re-run the measurement any time with:
+Capital loops; gas does not. Measured per operation by `test_Fork_MeasureCampaignGas` against the deployed
+bytecode:
+
+| operation | gas |
+|---|---|
+| `integrityBond.deposit` (once per campaign) | 33,577 |
+| `createListing` | 240,134 |
+| `settlement.pay` | 136,661 |
+| `confirmCompletion` | 24,790 |
+| `fundGuiltySide` (also opens the LMSR market) | 516,488 |
+| `spectralMarket.buy` | 115,921 |
+| `pokeSettlement` | 56,225 |
+| `finalizeDispute` | 44,575 |
+| `redeem` | 35,140 |
+| **one honest transaction** (create + pay + confirm) | **401,585** |
+| **one full dispute** (create + pay + fund + 3 buys + poke + finalize + redeem) | **1,376,986** |
+
+Which gives three campaign shapes:
+
+| shape | gas |
+|---|---|
+| **A — full**: 10 honest + 1 dispute | 5,426,413 |
+| **B — lean**: 3 honest + 1 dispute | 2,615,318 |
+| **C — minimum**: 1 honest + 1 dispute | 1,812,148 |
+
+### Putting it together
+
+Total ≈ `4.966 × P` (returns) + `gas × gasPrice` (spent). Gnosis mainnet base fee sits near zero — it was
+**85,216 wei/gas** when this was written, i.e. 0.000085 gwei — so at base fee, shape B costs about
+**0.00022 xDAI** in gas and shape A about **0.00046 xDAI**.
+
+| P | peak capital | + gas (shape B, at base fee) | total to have on hand |
+|---|---|---|---|
+| 0.00005 | 0.00025 | 0.00022 | **~0.0005** |
+| 0.001 | 0.0050 | 0.00022 | **~0.005** |
+| 0.01 | 0.0497 | 0.00022 | **~0.05** |
+| 0.1 | 0.497 | 0.00022 | **~0.5** |
+| 1 | 4.97 | 0.00022 | **~5** |
+
+> **Set the gas price manually.** The app deliberately does not force a low gas price on mainnet
+> (`LOW_GAS_FEES` in `walendria-app/src/lib/onchain.ts` is guarded to Chiado, so a future base-fee spike is
+> handled by the wallet automatically). That means your wallet picks, and wallets routinely suggest ~1 gwei
+> on Gnosis — which is over 10,000× the actual base fee and turns shape B's gas from 0.00022 into 0.0026
+> xDAI. Open the advanced gas controls and set something just above base fee.
+
+> Re-run any of these measurements with:
 > ```bash
 > forge test --match-path test/fork/MainnetCampaignCost.t.sol -vv
 > ```
 
 ---
+
+### Which shape to run
+
+Run whichever you can fund **today**, not the one you can fund eventually. Every shape produces real
+transaction hashes on mainnet and exercises the same code paths; the only thing P changes is how much a
+sceptic can say the amounts were trivial.
+
+There is a real answer to that objection, and it should be given rather than dodged: the protocol's
+per-transaction hardcap is 100 xDAI, so nothing here is ever demonstrating behaviour at a scale it was not
+built for, and the dispute mechanism is a fixed ratio of P — it behaves identically at every size, which is
+exactly what the seven-orders-of-magnitude sweep above establishes.
+
+A dispute run at a tiny P and published honestly beats a large one that never happens. If funds arrive
+later, run it again at a bigger P — the track record accumulates, and a second entry at a larger size is
+itself evidence that the first was not a fluke.
 
 ## 2. Wallets
 

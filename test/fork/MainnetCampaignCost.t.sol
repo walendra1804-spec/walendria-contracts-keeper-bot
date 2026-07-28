@@ -68,6 +68,144 @@ contract MainnetCampaignCostForkTest is Test {
         _measure(10 ether);
     }
 
+    /// @notice Answers the follow-up question the first measurement provokes: **how small can P go before the
+    ///         protocol stops behaving?** The peak-capital figure is a multiple of P, so the campaign budget is
+    ///         whatever the operator picks P to be — but only if the ratios survive at small sizes. LMSR works
+    ///         in fixed point over integer wei, so shrinking P shrinks the numbers every rounding step acts on,
+    ///         and there is no reason to assume the behaviour is scale-free without checking.
+    ///
+    ///         The contracts impose almost no floor of their own: ListingManager rejects only `price == 0`, and
+    ///         DisputeManager rejects only `price / 2 == 0` (i.e. 1 wei). So if the ratios hold down here, the
+    ///         real floor is a judgement about what a transaction size means, not a technical limit.
+    function test_Fork_SmallestViablePrice() public {
+        if (!forked) {
+            console.log("SKIP: no gnosis fork available (set the `gnosis` RPC endpoint to measure)");
+            return;
+        }
+
+        uint256[5] memory sizes = [uint256(0.000001 ether), 0.00001 ether, 0.0001 ether, 0.001 ether, 0.01 ether];
+        for (uint256 i = 0; i < sizes.length; i++) {
+            _measure(sizes[i]);
+        }
+    }
+
+    /// @notice Measures the **gas** each campaign operation actually burns against the deployed bytecode, and
+    ///         totals it for the whole campaign. This matters far more than it first appears: capital in this
+    ///         campaign is a loop — it is put up, then it comes back — whereas gas is the only part that is
+    ///         genuinely spent and never returns. Once P is pushed small enough, gas stops being a rounding
+    ///         error and becomes the entire budget, and the operator needs to know where that crossover sits
+    ///         before choosing P rather than after running out mid-campaign.
+    function test_Fork_MeasureCampaignGas() public {
+        if (!forked) {
+            console.log("SKIP: no gnosis fork available (set the `gnosis` RPC endpoint to measure)");
+            return;
+        }
+
+        // Indices into `g`. Held as an array rather than named locals purely because nine separate uint256s
+        // plus the ids overflows the EVM's 16-slot stack window ("stack too deep") in this test.
+        uint256[9] memory g;
+        _runCampaignForGas(0.001 ether, g);
+
+        uint256 perHonest = g[G_CREATE] + g[G_PAY] + g[G_CONFIRM];
+        uint256 dispute = g[G_CREATE] + g[G_PAY] + g[G_FUND] + (3 * g[G_BUY]) + g[G_POKE] + g[G_FINALIZE] + g[G_REDEEM];
+        uint256 campaign = g[G_DEPOSIT] + (10 * perHonest) + dispute;
+
+        console.log("");
+        console.log("=== GAS PER OPERATION (live mainnet bytecode) ===");
+        console.log("  integrityBond.deposit      : %s", g[G_DEPOSIT]);
+        console.log("  createListing              : %s", g[G_CREATE]);
+        console.log("  settlement.pay             : %s", g[G_PAY]);
+        console.log("  confirmCompletion          : %s", g[G_CONFIRM]);
+        console.log("  fundGuiltySide (opens mkt) : %s", g[G_FUND]);
+        console.log("  spectralMarket.buy         : %s", g[G_BUY]);
+        console.log("  pokeSettlement             : %s", g[G_POKE]);
+        console.log("  finalizeDispute            : %s", g[G_FINALIZE]);
+        console.log("  redeem                     : %s", g[G_REDEEM]);
+        console.log("");
+        console.log("  gas per honest transaction : %s", perHonest);
+        console.log("  gas for the full dispute   : %s", dispute);
+        console.log("  GAS FOR WHOLE CAMPAIGN     : %s", campaign);
+        console.log("");
+        console.log("  wei @ 0.001 gwei           : %s", campaign * 1_000_000);
+        console.log("  wei @ 0.1   gwei           : %s", campaign * 100_000_000);
+        console.log("  wei @ 1     gwei           : %s", campaign * 1_000_000_000);
+    }
+
+    uint256 internal constant G_DEPOSIT = 0;
+    uint256 internal constant G_CREATE = 1;
+    uint256 internal constant G_PAY = 2;
+    uint256 internal constant G_CONFIRM = 3;
+    uint256 internal constant G_FUND = 4;
+    uint256 internal constant G_BUY = 5;
+    uint256 internal constant G_POKE = 6;
+    uint256 internal constant G_FINALIZE = 7;
+    uint256 internal constant G_REDEEM = 8;
+
+    /// @dev Walks one full lifecycle at price `P`, recording gas for each step into `g`.
+    function _runCampaignForGas(uint256 P, uint256[9] memory g) internal {
+        address seller = makeAddr("gas-seller");
+        address buyer = makeAddr("gas-buyer");
+        vm.deal(seller, 50 * P);
+        vm.deal(buyer, 50 * P);
+
+        uint256 t;
+
+        vm.startPrank(seller);
+        t = gasleft();
+        integrityBond.deposit{value: (3 * P) / 2}();
+        g[G_DEPOSIT] = t - gasleft();
+
+        t = gasleft();
+        uint256 listingId = listingManager.createListing(P, 1, COMPLETION_WINDOW, "Campaign", "Proof run");
+        g[G_CREATE] = t - gasleft();
+        vm.stopPrank();
+
+        vm.prank(buyer);
+        t = gasleft();
+        settlement.pay{value: P}(listingId, 0);
+        g[G_PAY] = t - gasleft();
+
+        // Branch the state: time the honest ending, then rewind and time the dispute ending, so both are
+        // measured from the same starting point rather than one of them from a state the other mutated.
+        uint256 snap = vm.snapshotState();
+        vm.prank(buyer);
+        t = gasleft();
+        listingManager.confirmCompletion(listingId, 0);
+        g[G_CONFIRM] = t - gasleft();
+        vm.revertToState(snap);
+
+        uint256 marketId = disputeManager.marketIdOf(listingId, 0, 1);
+
+        vm.prank(buyer);
+        t = gasleft();
+        disputeManager.fundGuiltySide{value: P / 2}(listingId, 0);
+        g[G_FUND] = t - gasleft();
+
+        // 3P of shares, not 2P: the sweep above measured the 93% threshold at ~2.587P of shares, and a buy
+        // that stops short leaves pokeSettlement reverting with ConditionsNotYetMet.
+        vm.prank(buyer);
+        t = gasleft();
+        spectralMarket.buy{value: 10 * P}(marketId, SpectralMarket.Side.Guilty, 3 * P);
+        g[G_BUY] = t - gasleft();
+
+        (uint256 pGuilty,) = spectralMarket.currentPrice(marketId);
+        assertGe(pGuilty, THRESHOLD, "gas run must actually cross the threshold");
+
+        vm.warp(block.timestamp + 1 hours + 1);
+        t = gasleft();
+        settlementConditions.pokeSettlement(marketId);
+        g[G_POKE] = t - gasleft();
+
+        t = gasleft();
+        disputeManager.finalizeDispute(listingId, 0);
+        g[G_FINALIZE] = t - gasleft();
+
+        vm.prank(buyer);
+        t = gasleft();
+        spectralMarket.redeem(marketId);
+        g[G_REDEEM] = t - gasleft();
+    }
+
     /// @dev Runs one full staged dispute at price `P` and prints the capital profile. Every actor is funded
     ///      generously and the *balance deltas* are what get reported, so the numbers reflect what the
     ///      contracts actually charged rather than what was sent.
@@ -115,6 +253,13 @@ contract MainnetCampaignCostForkTest is Test {
 
         // Peak capital is what has to be liquid at once across every role, before anything unwinds.
         uint256 peak = ((3 * P) / 2) + P + (P / 2) + pushCost;
+
+        // Guards against a silent precision collapse at small P. Without these the sweep would happily print a
+        // quietly-wrong ratio for a size where rounding had eaten the position, and the campaign budget would
+        // be derived from a number that no longer described the protocol. 4.966 is the ratio measured at
+        // P = 0.1/1/10 xDAI; a 2% band is far tighter than any real drift and far looser than LMSR noise.
+        assertGt(redeemed, 0, "winner must redeem something");
+        assertApproxEqRel((peak * 1e18) / P, 4.966e18, 0.02e18, "peak/P must stay scale-free");
 
         console.log("");
         console.log("=== P = %s wei ===", P);
