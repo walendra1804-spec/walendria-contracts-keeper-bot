@@ -137,6 +137,13 @@ abstract contract CampaignBase is Script {
 /// forge script script/live/ProofCampaign.s.sol:ProofCampaignPhase1 \
 ///   --rpc-url gnosis --account walendria-chiado --broadcast --slow
 /// ```
+///
+/// From Windows cmd.exe the `VAR=value` prefix is not valid syntax; use (quotes required, or the trailing
+/// space before `&&` becomes part of the value and `vm.envOr` cannot parse it):
+///
+/// ```cmd
+/// set "CAMPAIGN_PRICE=50000000000000" && set "CAMPAIGN_HONEST_COUNT=3" && forge script ... --broadcast --slow
+/// ```
 contract ProofCampaignPhase1 is CampaignBase {
     function run() external {
         uint256 P = _price();

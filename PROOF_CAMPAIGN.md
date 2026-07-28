@@ -125,6 +125,16 @@ forge script script/live/ProofCampaign.s.sol:ProofCampaignPhase1 \
 `CAMPAIGN_PRICE` is P in wei (the example is 0.00005 xDAI). `--slow` is mandatory: the public RPC pool
 scrambles nonces if forge pipelines transactions.
 
+**Shell note — this repo is worked on from Windows.** The `VAR=value command` prefix above is bash/Git Bash
+syntax; in Command Prompt it fails with `'CAMPAIGN_PRICE' is not recognized`. The cmd.exe equivalent is:
+
+```cmd
+set "CAMPAIGN_PRICE=50000000000000" && set "CAMPAIGN_HONEST_COUNT=3" && forge script script/live/ProofCampaign.s.sol:ProofCampaignPhase1 --rpc-url gnosis --account walendria-chiado --broadcast --slow
+```
+
+Keep the quotes: unquoted, `set X=1 && ...` stores the trailing space as part of the value and `vm.envOr`
+fails to parse the number. In PowerShell it is `$env:CAMPAIGN_PRICE="50000000000000"; …` instead.
+
 Before spending anything the script checks the wallet covers the peak, so an underfunded run fails costing
 nothing rather than halfway through leaving a half-open dispute nobody can finish. At the end it prints the
 listing id and asserts the Guilty price actually crossed 93% — a failure surfaces there, not an hour later.
@@ -141,6 +151,12 @@ a protocol property, not a scripting limitation — nothing collapses it into on
 CAMPAIGN_LISTING_ID=<id printed by phase 1> \
 forge script script/live/ProofCampaign.s.sol:ProofCampaignPhase2 \
   --rpc-url gnosis --account walendria-chiado --broadcast --slow
+```
+
+or, from Command Prompt:
+
+```cmd
+set "CAMPAIGN_LISTING_ID=<id printed by phase 1>" && forge script script/live/ProofCampaign.s.sol:ProofCampaignPhase2 --rpc-url gnosis --account walendria-chiado --broadcast --slow
 ```
 
 Pokes settlement (skipping it gracefully if the keeper bot got there first), finalizes the dispute, claims
