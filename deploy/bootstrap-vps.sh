@@ -11,6 +11,15 @@
 #
 # It is idempotent: re-running it is safe and will skip what is already in place.
 #
+# DO NOT wrap this script in `systemd-run --collect`. That was tried on 2026-08-19 to keep the
+# run alive across an SSH disconnect, and it silently undid the whole thing: pm2 and both apps
+# land in the transient unit's cgroup, and systemd kills the entire cgroup when the oneshot unit
+# finishes. The log reads as a clean success - phase 6 even reported the app answering 200 - and
+# then nothing is running a second later. If you need it to survive a disconnect, use
+# `--property=KillMode=process`, or run it under tmux/screen, or just run it in the foreground and
+# recover with `systemctl restart pm2-root` (the phase 5 `pm2 save` makes that a full restore).
+# The build inside phase 4 has its own systemd-run and is unaffected: it exits before pm2 starts.
+#
 # ---------------------------------------------------------------------------------------------
 # WHAT THIS SCRIPT DELIBERATELY CHANGES FROM THE OLD BOX
 # ---------------------------------------------------------------------------------------------
