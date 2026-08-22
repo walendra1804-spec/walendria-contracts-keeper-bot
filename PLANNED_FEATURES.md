@@ -14,12 +14,20 @@ confirmed by hand from `/topup/admin`. Everything else — order ledger, unique-
 admission, the dynamic-QRIS converter, the buyer status page — is built and tested. This entry is only the
 automation on top.
 
-- **Blocked on an account, not on code.** OkeConnect is the H2H side of OrderKuota, and registration
-  requires the OrderKuota Android app (Play Store only, no iOS build, and the web dashboard only serves
-  accounts that already exist). Until there is Android access — emulator, borrowed handset, or a cheap
-  used device — the credentials cannot be obtained. Once they are: dashboard → Payment H2H → API
-  Integration gives a Merchant Code and API Key plus the mutation endpoint's real spec. **Copy that spec
-  from the dashboard rather than from any third-party write-up**; it is an unofficial API and it moves.
+- **Not on the critical path.** The desk runs today on a merchant QRIS obtained from an e-wallet with an
+  iOS app (DANA Bisnis, GoPay Merchant, OVO, ShopeePay, LinkAja — micro-merchant tier needs KTP and a
+  photo of the business, no NPWP below Rp500 juta/year turnover, 1-7 working days to verify). None of
+  those expose a mutation API, so confirmation stays manual, which is fine well past the volume that
+  currently exists. Only the raw static QRIS payload is needed for `TOPUP_QRIS_PAYLOAD`; scan the issued
+  QR with any reader to read it out.
+- **OkeConnect is the upgrade, and it is Android-gated.** It is the H2H side of OrderKuota, and
+  registration requires the OrderKuota app from the Play Store — no iOS build, and the web dashboard only
+  serves accounts that already exist. Emulator, borrowed handset, or a cheap used device. Once in:
+  dashboard → Payment H2H → API Integration gives a Merchant Code and API Key plus the mutation
+  endpoint's real spec. **Copy that spec from the dashboard rather than from any third-party write-up**;
+  it is an unofficial API and it moves.
+- **The migration costs the buyer nothing.** Same unique nominal, same status page, same order ledger.
+  Only the confirmation leg swaps, from a person reading a notification to a worker reading an endpoint.
 - **Where it plugs in.** A worker polls the mutation list every 10-20s and, on an exact `totalIdr` match
   against an order whose code is still held, calls the same `markPaid(id)` the admin console already calls.
   That function is idempotent, so a duplicate poll cannot double-credit. The admin console stays as the
@@ -38,11 +46,19 @@ automation on top.
 - Credentials go in `.env.local` **without** a `NEXT_PUBLIC_` prefix, and polling never runs from a page
   request — a page load must not be able to hit the provider's rate limit.
 
-Before any of this: **measure the real restock round-trip** (rupiah → CEX → xDAI on Gnosis, timed end to
-end with the smallest possible amount). The 12-hour promise in `TOPUP_LIMITS.scheduledWindowMs` is a
-guess until that number exists, and it is worse to publish a window that is missed than to publish a
-longer one that is kept. If the CEX cannot withdraw natively on Gnosis and a bridge is involved, the
-window has to be set from the bridged timing, not the direct one.
+**Restock round-trip is measured: about four minutes.** Rupiah balance → Pintu → buy ETH → withdraw to an
+ERC-20 wallet (those three, 2-3 minutes) → bridge to Gnosis on relay.link (1 minute). So the fulfilment
+window is not about mechanics at all, it is about how soon a human notices; it now lives in
+`TopupConfig.scheduledWindowMs` and is set from `/topup/admin`.
+
+Two things that measurement opens up, neither done yet:
+
+- **Per-restock cost is now the constraint, not per-restock time.** Every cycle pays an L1 withdrawal fee
+  plus a bridge fee, which is a fixed cost against a variable order size, so restocking once per order
+  destroys the margin on small ones. Batch instead: restock in chunks sized to a day, not to an order.
+- **Check whether Pintu can withdraw on a cheaper network than Ethereum L1.** relay.link bridges from
+  Base, Arbitrum, Polygon and others, so if any of those is a supported withdrawal network the L1 fee
+  disappears from every cycle. Worth one look; it is pure margin.
 
 ---
 
