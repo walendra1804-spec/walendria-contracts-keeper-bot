@@ -203,9 +203,14 @@ DISCUSSION_DB_PATH=/root/walendria-discussion.json
 # swapping this string is also how a completed outlet rename reaches the site.
 TOPUP_QRIS_PAYLOAD=
 
-# Rupiah per 1 xDAI, margin included. Frozen into each order at creation, so changing it never
-# rewrites a price already shown to somebody.
+# Rupiah per 1 xDAI, BEFORE the fee below. Frozen into each order at creation, so changing it never
+# rewrites a price already shown to somebody. Set it from the real acquisition cost through the
+# exchange with fees included, not from a headline market price.
 TOPUP_IDR_PER_XDAI=
+
+# Desk fee in percent, shown to the buyer on its own line. Defaults to 1 when unset, deliberately not
+# to 0: a mistyped variable would otherwise have the desk work perfectly while giving the margin away.
+TOPUP_FEE_PERCENT=1
 
 # The wallet buyers are sent xDAI FROM. Address only - no private key belongs on this box while
 # sending is still done by hand from the admin console. Public by design: the status page links
