@@ -189,9 +189,38 @@ PINATA_JWT=
 # Outside the app directory on purpose: a redeploy replaces the whole app tree and would
 # otherwise wipe every discussion post.
 DISCUSSION_DB_PATH=/root/walendria-discussion.json
+
+# --- xDAI top-up desk (/topup) -------------------------------------------------------------
+# Left blank on purpose. The QRIS payload carries the operator's registered legal name and
+# merchant NMID, and this repo is public, so it is pasted onto the box rather than committed.
+# Until all three are filled the desk still renders but refuses every order while naming the
+# missing piece, which is the intended degraded mode - it never shows a payment instruction it
+# cannot honour.
+
+# The raw STATIC payload a QR reader gets out of the merchant QR. Checked on read: a payload
+# whose own CRC does not verify is refused as configuration error, which is what a copy-paste
+# truncated halfway looks like. The payee name shown to buyers is read from its tag 59, so
+# swapping this string is also how a completed outlet rename reaches the site.
+TOPUP_QRIS_PAYLOAD=
+
+# Rupiah per 1 xDAI, margin included. Frozen into each order at creation, so changing it never
+# rewrites a price already shown to somebody.
+TOPUP_IDR_PER_XDAI=
+
+# The wallet buyers are sent xDAI FROM. Address only - no private key belongs on this box while
+# sending is still done by hand from the admin console. Public by design: the status page links
+# it on the explorer so a waiting buyer can watch a restock land without taking anyone's word.
+# Never the deployer address; it controls DeveloperPool.setWithdrawalRecipient.
+TOPUP_HOT_WALLET_ADDRESS=
+
+# The ledger. Outside the app tree for the same reason as DISCUSSION_DB_PATH, and it matters far
+# more here: an incoming QRIS transfer leaves no on-chain trace, so this file is the only record
+# of who has paid and not yet been served, reconstructible from nowhere. Back it up.
+TOPUP_DB_PATH=/root/walendria-topup.json
 ENVEOF
   chmod 600 "$APP_DIR/.env.local"
   warn "Fill PINATA_JWT in $APP_DIR/.env.local (evidence upload stays disabled until you do)."
+  warn "Fill TOPUP_QRIS_PAYLOAD / TOPUP_IDR_PER_XDAI / TOPUP_HOT_WALLET_ADDRESS (the /topup desk refuses orders until then)."
 fi
 
 if [ ! -f "$APP_DIR/ecosystem.config.js" ]; then
