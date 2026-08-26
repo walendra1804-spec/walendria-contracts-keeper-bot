@@ -98,6 +98,39 @@ if ! command -v cloudflared >/dev/null 2>&1; then
 fi
 log "cloudflared $(cloudflared --version 2>&1 | head -1)"
 
+# ---- swap ---------------------------------------------------------------------------------------
+# The build is what sizes this box, not the running site. Steady state is modest - cloudflared, the
+# keeper, and a Next.js server capped at 900M - but `npm run build` peaks far above that, AND phase 4
+# runs it while the old app is still serving from the .next it is overwriting.
+#
+# That makes an OOM during build uniquely expensive here: the build dies with .next already gutted,
+# so the site serves 500s until somebody successfully rebuilds. Losing the build is not the failure,
+# losing the site until the next successful build is.
+#
+# So: guarantee headroom rather than hope for it. Swap is not a substitute for RAM in steady state,
+# but it is exactly right for a short allocation spike that would otherwise be fatal, which is what a
+# bundler peak is. Sized to bring total addressable memory to at least 6G, skipped entirely when the
+# box already has swap or has enough RAM not to need it.
+if [ -z "$(swapon --show --noheadings 2>/dev/null)" ]; then
+  mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+  want_mb=$((6144 - mem_mb))
+  if [ "$want_mb" -gt 0 ]; then
+    log "no swap present and ${mem_mb}M RAM; adding ${want_mb}M swapfile"
+    fallocate -l "${want_mb}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$want_mb" status=none
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+    swapon /swapfile
+    grep -q "^/swapfile" /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    # Low swappiness: this exists for the build spike, not to page out a running server.
+    sysctl -w vm.swappiness=10 >/dev/null
+    grep -q "^vm.swappiness" /etc/sysctl.conf || echo "vm.swappiness=10" >> /etc/sysctl.conf
+  else
+    log "${mem_mb}M RAM, no swapfile needed"
+  fi
+else
+  log "swap already present: $(swapon --show --noheadings | head -1)"
+fi
+
 # =================================================================================================
 # PHASE 2 - firewall
 # =================================================================================================
