@@ -81,9 +81,18 @@ log "node $(node -v) / npm $(npm -v)"
 command -v pm2 >/dev/null 2>&1 || { log "installing pm2"; npm install -g pm2 >/dev/null; }
 
 if ! command -v cloudflared >/dev/null 2>&1; then
-  log "installing cloudflared"
+  # Architecture is detected, not assumed. Every box this ran on so far was x86, but the cheapest
+  # capable hosts are increasingly ARM (Hetzner's CAX line, Oracle's always-free Ampere tier), and
+  # dpkg installing an amd64 .deb on arm64 fails deep in phase 6 with the tunnel refusing to start,
+  # which reads as a Cloudflare problem rather than as the wrong binary.
+  case "$(dpkg --print-architecture)" in
+    amd64) CF_ARCH=amd64 ;;
+    arm64) CF_ARCH=arm64 ;;
+    *) echo "FATAL: unsupported arch $(dpkg --print-architecture) for cloudflared" >&2; exit 1 ;;
+  esac
+  log "installing cloudflared ($CF_ARCH)"
   curl -fsSL -o /tmp/cloudflared.deb \
-    https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}.deb"
   dpkg -i /tmp/cloudflared.deb >/dev/null
   rm -f /tmp/cloudflared.deb
 fi
