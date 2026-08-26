@@ -45,10 +45,18 @@ except ImportError:
 
 
 # Defaults for the box handed over on 2026-08-18. Override on the command line if the provider
-# rotates the IP or changes the SSH port.
+# rotates the IP, changes the SSH port, or hands over a box whose admin account is not root.
+#
+#     python install_claude_key.py <host> [port] [user]
+#
+# The user argument matters more than it looks. Every box from the original reseller was root on
+# 22054, but a box carved out of a cloud subscription (Azure, GCP) typically disables root login
+# entirely and hands over a sudo-capable named account instead. Passing the wrong user there does
+# not fail cleanly - it fails as an auth error indistinguishable from a wrong password, and each
+# retry walks toward the fail2ban ban window.
 DEFAULT_HOST = "203.175.125.140"
 DEFAULT_PORT = 22054
-USER = "root"
+DEFAULT_USER = "root"
 
 # The pair of files created by ssh-keygen on the working machine on 2026-07-14. The private key
 # is what Claude uses to SSH in; the public key is what gets appended to authorized_keys on the
@@ -78,6 +86,7 @@ def prompt_new_password() -> str:
 def main() -> None:
     host = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_HOST
     port = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_PORT
+    user = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_USER
 
     # Load pubkey up front. Failing here saves the user typing two passwords for nothing.
     if not PUBKEY_PATH.exists():
@@ -93,7 +102,7 @@ def main() -> None:
         print("Cannot verify key auth after install without the private half.")
         sys.exit(1)
 
-    print(f"Target: {USER}@{host}:{port}")
+    print(f"Target: {user}@{host}:{port}")
     print("Nothing you type below is shown or logged.")
     print()
 
@@ -119,7 +128,7 @@ def main() -> None:
         client.connect(
             hostname=host,
             port=port,
-            username=USER,
+            username=user,
             password=initial_pw,
             allow_agent=False,
             look_for_keys=False,
@@ -168,15 +177,21 @@ def main() -> None:
     # chpasswd reads "user:password" pairs from stdin. Piping this way keeps the password out of
     # ps output, shell history, and any command-line log.
     stdin, stdout, stderr = client.exec_command("chpasswd")
-    stdin.channel.send(f"{USER}:{new_pw}\n")
+    stdin.channel.send(f"{user}:{new_pw}\n")
     stdin.channel.shutdown_write()
     exit_code = stdout.channel.recv_exit_status()
     if exit_code != 0:
         err = stderr.read().decode("utf-8", errors="replace")
-        print(f"ERROR: chpasswd failed (exit {exit_code}): {err}")
-        client.close()
-        sys.exit(1)
-    print("      OK")
+        # Deliberately NOT fatal. The key went in at step 2, so bailing here would abort before the
+        # verify step and leave the operator unsure whether they can get back in at all. chpasswd
+        # needs root, so this is the expected outcome on a cloud box handed over as a sudo-capable
+        # named account rather than as root - and there the seller's password staying alive is a
+        # thing to go fix in the provider's console, not a reason to unwind a working key install.
+        print(f"      SKIPPED: chpasswd failed (exit {exit_code}): {err.strip()}")
+        print(f"      The seller's password for '{user}' is still valid. Change it yourself with")
+        print("      'sudo passwd' once you are in, or disable password auth entirely.")
+    else:
+        print("      OK")
     client.close()
 
     # ---- [4/4] verify key auth actually works ----
@@ -190,7 +205,7 @@ def main() -> None:
         verify.connect(
             hostname=host,
             port=port,
-            username=USER,
+            username=user,
             key_filename=str(PRIVKEY_PATH),
             allow_agent=False,
             look_for_keys=False,
