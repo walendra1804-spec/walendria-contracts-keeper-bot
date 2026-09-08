@@ -7,6 +7,45 @@ and delete it from here.
 
 ---
 
+## Let a settled dispute be closed by agreement even after outsiders traded (walendria-contracts)
+
+`DisputeManager.mutualClose` is permanently disabled for a dispute the moment any address other than the
+buyer and the seller has *ever* held a position in its market. `_requireNoThirdParty` reads
+`SpectralMarket.distinctHolderCount`, which is monotonic and never decremented, so an outside trader who
+bought and then fully exited leaves the path closed forever. That is deliberate and correct as written: if
+two parties could close a market that still held a stranger's money, they could agree on whichever verdict
+zeroed that stranger's position.
+
+**What it costs in practice, and why this is worth revisiting.** Two parties who reconcile after an outsider
+has traded have exactly one route left: buy the agreed side up to the 93% threshold, wait out
+`CUMULATIVE_DURATION`, and let anyone poke. That route is permissionless, so nobody can be held hostage by a
+counterparty who walks away, and the pusher recovers nearly all of the outlay by redeeming. But it costs
+`P * ln((e^x + 1) / 2)` where `x = ln(0.93/0.07)`, which is **~1.97 * P of working capital** held for an
+hour, and it always ends with a winner and a loser. There is no draw. Whichever verdict they agree on, the
+0.5P that funded the Guilty side transfers to the other party.
+
+**The part that is a real risk, not just an inconvenience.** Restoring the draw means the winner sending
+0.5P back off-chain, by ordinary transfer, on nothing but their word. That is precisely the trust the whole
+protocol exists to remove, reintroduced at the last step and at the worst moment: the buyer has just been
+persuaded to accept an Innocent verdict, and the only thing standing between them and losing 0.5P is a
+counterparty who has already left the on-chain flow and has no further obligation the contracts can see. A
+seller who intended to walk has every reason to push for reconciliation first. So "they made peace" and "the
+buyer got their money back" are not the same event, and the protocol currently cannot tell them apart.
+
+**Shape of a fix, for the next deployment.** Not settled, and deliberately not designed here beyond the
+constraint it has to satisfy: any relaxation must make the outside traders whole from the market itself
+before the two parties may close it, so that closing by agreement is never a way to reach into a third
+party's position. One candidate is a `mutualCloseWithRefund` that requires every address in
+`distinctHolderCount` beyond the two parties to hold a zero balance AND to have been bought out at the
+last traded price, funded by the closing parties. Another is a genuine draw verdict that returns each side's
+0.5P instead of paying one side, which removes the off-chain settlement entirely and is probably the more
+honest primitive, but it changes `_finalize`, the `Side` enum, and every test that destructures a verdict.
+
+Whichever is chosen, it is a redeploy at new addresses (the deployment is immutable), so it belongs in the
+same batch as any other contract change rather than on its own.
+
+---
+
 ## QRIS mutation poller for the top-up desk (walendria-app)
 
 The desk at `/topup` ships complete except for one leg: nothing reads the merchant account, so payments are
