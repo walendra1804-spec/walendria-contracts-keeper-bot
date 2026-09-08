@@ -2,10 +2,37 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "walendria-app-dev",
+      "name": "walendria-app",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["--prefix", "D:/walendria-app", "run", "dev"],
+      "runtimeArgs": [
+        "--prefix",
+        "D:/walendria-app",
+        "run",
+        "dev"
+      ],
       "port": 3000
+    },
+    {
+      "name": "walendria-app-workers",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--prefix",
+        "D:/walendria-app",
+        "run",
+        "dev:vinext"
+      ],
+      "port": 3001
+    },
+    {
+      "name": "walendria-app-built",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--prefix",
+        "D:/walendria-app",
+        "run",
+        "start:vinext"
+      ],
+      "port": 8787
     }
   ]
 }
